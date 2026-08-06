@@ -10,6 +10,8 @@ import (
 	"image/jpeg"
 	_ "image/png"
 	"path"
+	"strconv"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/pelfox/gophprofile/internal/config"
@@ -26,6 +28,17 @@ const (
 	consumerPrefetch     = 1
 	thumbnailContentType = "image/jpeg"
 	thumbnailQuality     = 90
+
+	// retryCountHeader stores the number of prior processing attempts.
+	retryCountHeader = "x-retry-count"
+	// maxRetryAttempts is how many times a failed job is retried before
+	// being dropped.
+	maxRetryAttempts = 5
+	// baseRetryDelay is the backoff delay after the first failure; it
+	// doubles with every subsequent attempt.
+	baseRetryDelay = 500 * time.Millisecond
+	// maxRetryDelay caps the exponential backoff delay.
+	maxRetryDelay = 30 * time.Second
 )
 
 type thumbnailSize struct {
@@ -99,6 +112,16 @@ func consumeQueues(
 		return err
 	}
 
+	resizeRetryQueue, err := declareRetryQueue(channel, queue.ResizeQueueName)
+	if err != nil {
+		return err
+	}
+
+	deleteRetryQueue, err := declareRetryQueue(channel, queue.DeleteQueueName)
+	if err != nil {
+		return err
+	}
+
 	if err := channel.Qos(consumerPrefetch, 0, false); err != nil {
 		return fmt.Errorf("failed to configure worker prefetch: %w", err)
 	}
@@ -141,7 +164,9 @@ func consumeQueues(
 
 			if err := processor.processResize(ctx, delivery.Body); err != nil {
 				logger.Error().Err(err).Msg("failed to process resize job")
-				if err := rejectDelivery(delivery, err); err != nil {
+				if err := handleFailedDelivery(
+					channel, logger, delivery, resizeRetryQueue.Name, err,
+				); err != nil {
 					return err
 				}
 				continue
@@ -157,7 +182,9 @@ func consumeQueues(
 
 			if err := processor.processDelete(ctx, delivery.Body); err != nil {
 				logger.Error().Err(err).Msg("failed to process delete job")
-				if err := rejectDelivery(delivery, err); err != nil {
+				if err := handleFailedDelivery(
+					channel, logger, delivery, deleteRetryQueue.Name, err,
+				); err != nil {
 					return err
 				}
 				continue
@@ -186,14 +213,126 @@ func declareQueue(channel *amqp.Channel, name string) (amqp.Queue, error) {
 	return queue, nil
 }
 
-func rejectDelivery(delivery amqp.Delivery, err error) error {
-	requeue := errors.Is(err, context.Canceled) ||
-		errors.Is(err, context.DeadlineExceeded)
-	if nackErr := delivery.Nack(false, requeue); nackErr != nil {
-		return fmt.Errorf("failed to reject job: %w", nackErr)
+// declareRetryQueue declares a holding queue that dead-letters expired
+// messages back into targetQueue, used to delay retries without requiring
+// the RabbitMQ delayed-message plugin.
+func declareRetryQueue(
+	channel *amqp.Channel,
+	targetQueue string,
+) (amqp.Queue, error) {
+	name := targetQueue + ".retry"
+	queue, err := channel.QueueDeclare(
+		name,
+		true,
+		false,
+		false,
+		false,
+		amqp.Table{
+			"x-dead-letter-exchange":    "",
+			"x-dead-letter-routing-key": targetQueue,
+		},
+	)
+	if err != nil {
+		return amqp.Queue{}, fmt.Errorf("failed to declare %s queue: %w", name, err)
 	}
 
+	return queue, nil
+}
+
+// handleFailedDelivery decides whether to retry a failed job with
+// exponential backoff or give up after too many attempts. Retries are
+// implemented by republishing to a per-queue retry queue with a
+// per-message TTL; once the TTL expires, RabbitMQ dead-letters the
+// message back into the original queue for reprocessing.
+func handleFailedDelivery(
+	channel *amqp.Channel,
+	logger zerolog.Logger,
+	delivery amqp.Delivery,
+	retryQueueName string,
+	processingErr error,
+) error {
+	if errors.Is(processingErr, context.Canceled) ||
+		errors.Is(processingErr, context.DeadlineExceeded) {
+		if err := delivery.Nack(false, true); err != nil {
+			return fmt.Errorf("failed to requeue job: %w", err)
+		}
+		return nil
+	}
+
+	attempt := retryAttempt(delivery.Headers) + 1
+	if attempt > maxRetryAttempts {
+		logger.Error().
+			Err(processingErr).
+			Int("attempts", attempt-1).
+			Msg("giving up after exhausting retry attempts")
+		if err := delivery.Ack(false); err != nil {
+			return fmt.Errorf("failed to drop poison job: %w", err)
+		}
+		return nil
+	}
+
+	delay := backoffDelay(attempt)
+	headers := amqp.Table{}
+	for key, value := range delivery.Headers {
+		headers[key] = value
+	}
+	headers[retryCountHeader] = int32(attempt)
+
+	err := channel.PublishWithContext(
+		context.Background(),
+		"",
+		retryQueueName,
+		false,
+		false,
+		amqp.Publishing{
+			ContentType:  delivery.ContentType,
+			DeliveryMode: amqp.Persistent,
+			Headers:      headers,
+			Body:         delivery.Body,
+			Expiration:   strconv.FormatInt(delay.Milliseconds(), 10),
+		},
+	)
+	if err != nil {
+		logger.Error().
+			Err(err).
+			Msg("failed to schedule retry, requeueing immediately instead")
+		if nackErr := delivery.Nack(false, true); nackErr != nil {
+			return fmt.Errorf("failed to requeue job: %w", nackErr)
+		}
+		return nil
+	}
+
+	logger.Warn().
+		Err(processingErr).
+		Int("attempt", attempt).
+		Dur("delay", delay).
+		Msg("scheduled job retry with backoff")
+
+	if err := delivery.Ack(false); err != nil {
+		return fmt.Errorf("failed to acknowledge job pending retry: %w", err)
+	}
 	return nil
+}
+
+func retryAttempt(headers amqp.Table) int {
+	switch value := headers[retryCountHeader].(type) {
+	case int32:
+		return int(value)
+	case int64:
+		return int(value)
+	case int:
+		return value
+	default:
+		return 0
+	}
+}
+
+func backoffDelay(attempt int) time.Duration {
+	delay := baseRetryDelay * time.Duration(int64(1)<<uint(attempt-1))
+	if delay > maxRetryDelay {
+		return maxRetryDelay
+	}
+	return delay
 }
 
 func (p *processor) processResize(ctx context.Context, body []byte) error {
