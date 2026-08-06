@@ -24,6 +24,8 @@ type AppConfig struct {
 	S3AccessKey string `env:"S3_ACCESS_KEY"`
 	// S3SecretKey is the secret key for S3-compatible storage.
 	S3SecretKey string `env:"S3_SECRET_KEY"`
+	// S3Bucket is the bucket used for avatar object storage.
+	S3Bucket string `env:"S3_BUCKET"`
 }
 
 // Load loads AppConfig from .env and environment variables.
