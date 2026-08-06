@@ -11,8 +11,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pelfox/gophprofile/internal/config"
@@ -63,7 +61,13 @@ func Run(logger zerolog.Logger, cfg *config.AppConfig) error {
 	avatarsService := services.NewAvatarsService(
 		logger,
 		avatarsRepository,
-		newS3Storage(cfg),
+		storage.NewS3StorageFromConfig(storage.S3StorageConfig{
+			Region:    cfg.S3Region,
+			Endpoint:  cfg.S3Endpoint,
+			AccessKey: cfg.S3AccessKey,
+			SecretKey: cfg.S3SecretKey,
+			Bucket:    cfg.S3Bucket,
+		}),
 		queueProvider,
 	)
 	avatarsController := controllers.NewAvatarsController(
@@ -114,33 +118,6 @@ func newRouter(avatarsController *controllers.AvatarsController) http.Handler {
 	})
 
 	return router
-}
-
-func newS3Storage(cfg *config.AppConfig) storage.Provider {
-	awsCfg := aws.Config{
-		Region: cfg.S3Region,
-	}
-	if cfg.S3AccessKey != "" || cfg.S3SecretKey != "" {
-		awsCfg.Credentials = aws.CredentialsProviderFunc(
-			func(context.Context) (aws.Credentials, error) {
-				return aws.Credentials{
-					AccessKeyID:     cfg.S3AccessKey,
-					SecretAccessKey: cfg.S3SecretKey,
-				}, nil
-			},
-		)
-	}
-
-	client := s3.NewFromConfig(awsCfg, func(options *s3.Options) {
-		if cfg.S3Endpoint == "" {
-			return
-		}
-
-		options.BaseEndpoint = aws.String(cfg.S3Endpoint)
-		options.UsePathStyle = true
-	})
-
-	return storage.NewS3Storage(client, cfg.S3Bucket, cfg.S3Endpoint)
 }
 
 func consumeResizeDoneQueue(

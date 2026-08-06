@@ -48,7 +48,7 @@ type AvatarMetadataResponse struct {
 	// S3Key is the object key for the original avatar file in S3.
 	S3Key string `json:"s3_key"`
 	// ThumbnailS3Keys stores S3 object keys for generated thumbnails.
-	ThumbnailS3Keys any `json:"thumbnail_s3_keys"`
+	ThumbnailS3Keys models.ThumbnailS3Keys `json:"thumbnail_s3_keys"`
 	// UploadStatus is the current upload state.
 	UploadStatus models.UploadStatus `json:"upload_status"`
 	// ProcessingStatus is the current post-processing state.

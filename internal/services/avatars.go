@@ -255,13 +255,14 @@ func (s *avatarsService) Create(
 		AvatarID:    avatar.ID,
 	})
 	if err != nil {
-		avatar, err = s.updateUploadStatus(ctx, avatar.ID, models.UploadStatusFailed)
-		if err != nil {
-			logger.Error().Err(err).Msg("failed to update upload status")
+		storeErr := err
+		_, statusErr := s.updateUploadStatus(ctx, avatar.ID, models.UploadStatusFailed)
+		if statusErr != nil {
+			logger.Error().Err(statusErr).Msg("failed to update upload status")
 			return nil, ErrUploadFailed
 		}
 
-		logger.Error().Err(err).Msg("failed to upload avatar to S3")
+		logger.Error().Err(storeErr).Msg("failed to upload avatar to S3")
 		return nil, ErrUploadFailed
 	}
 

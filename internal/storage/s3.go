@@ -19,6 +19,15 @@ type s3Storage struct {
 	prefix string
 }
 
+// S3StorageConfig stores settings needed to create an S3 storage provider.
+type S3StorageConfig struct {
+	Region    string
+	Endpoint  string
+	AccessKey string
+	SecretKey string
+	Bucket    string
+}
+
 // NewS3Storage creates an S3-backed avatar storage provider.
 func NewS3Storage(
 	client *s3.Client,
@@ -30,6 +39,34 @@ func NewS3Storage(
 		bucket: bucket,
 		prefix: prefix,
 	}
+}
+
+// NewS3StorageFromConfig creates an S3-backed provider from storage settings.
+func NewS3StorageFromConfig(cfg S3StorageConfig) Provider {
+	awsCfg := aws.Config{
+		Region: cfg.Region,
+	}
+	if cfg.AccessKey != "" || cfg.SecretKey != "" {
+		awsCfg.Credentials = aws.CredentialsProviderFunc(
+			func(context.Context) (aws.Credentials, error) {
+				return aws.Credentials{
+					AccessKeyID:     cfg.AccessKey,
+					SecretAccessKey: cfg.SecretKey,
+				}, nil
+			},
+		)
+	}
+
+	client := s3.NewFromConfig(awsCfg, func(options *s3.Options) {
+		if cfg.Endpoint == "" {
+			return
+		}
+
+		options.BaseEndpoint = aws.String(cfg.Endpoint)
+		options.UsePathStyle = true
+	})
+
+	return NewS3Storage(client, cfg.Bucket, cfg.Endpoint)
 }
 
 func (s *s3Storage) Store(

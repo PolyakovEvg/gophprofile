@@ -11,8 +11,6 @@ import (
 	_ "image/png"
 	"path"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/google/uuid"
 	"github.com/pelfox/gophprofile/internal/config"
 	"github.com/pelfox/gophprofile/internal/queue"
@@ -65,39 +63,18 @@ func Run(
 	defer queueProvider.Close()
 
 	processor := &processor{
-		logger:  logger.With().Str("worker", "avatar").Logger(),
-		queue:   queueProvider,
-		storage: newS3Storage(cfg),
+		logger: logger.With().Str("worker", "avatar").Logger(),
+		queue:  queueProvider,
+		storage: storage.NewS3StorageFromConfig(storage.S3StorageConfig{
+			Region:    cfg.S3Region,
+			Endpoint:  cfg.S3Endpoint,
+			AccessKey: cfg.S3AccessKey,
+			SecretKey: cfg.S3SecretKey,
+			Bucket:    cfg.S3Bucket,
+		}),
 	}
 
 	return consumeQueues(ctx, processor.logger, conn, processor)
-}
-
-func newS3Storage(cfg *config.WorkerConfig) storage.Provider {
-	awsCfg := aws.Config{
-		Region: cfg.S3Region,
-	}
-	if cfg.S3AccessKey != "" || cfg.S3SecretKey != "" {
-		awsCfg.Credentials = aws.CredentialsProviderFunc(
-			func(context.Context) (aws.Credentials, error) {
-				return aws.Credentials{
-					AccessKeyID:     cfg.S3AccessKey,
-					SecretAccessKey: cfg.S3SecretKey,
-				}, nil
-			},
-		)
-	}
-
-	client := s3.NewFromConfig(awsCfg, func(options *s3.Options) {
-		if cfg.S3Endpoint == "" {
-			return
-		}
-
-		options.BaseEndpoint = aws.String(cfg.S3Endpoint)
-		options.UsePathStyle = true
-	})
-
-	return storage.NewS3Storage(client, cfg.S3Bucket, cfg.S3Endpoint)
 }
 
 func consumeQueues(

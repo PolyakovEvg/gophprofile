@@ -129,7 +129,12 @@ func (c *AvatarsController) GetByID(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", mimeType)
 	w.Header().Set("Cache-Control", "public, max-age=86400")
 	w.WriteHeader(http.StatusOK)
-	w.Write(avatar)
+	if _, err := w.Write(avatar); err != nil {
+		c.logger.Error().
+			Err(err).
+			Str("avatar_id", avatarID.String()).
+			Msg("failed to write avatar response")
+	}
 }
 
 // GetMetadata handles requests for avatar metadata.
@@ -222,5 +227,10 @@ func (c *AvatarsController) GetUserAvatar(
 	w.Header().Set("Content-Type", mimeType)
 	w.Header().Set("Cache-Control", "public, max-age=86400")
 	w.WriteHeader(http.StatusOK)
-	w.Write(avatarBytes)
+	if _, err := w.Write(avatarBytes); err != nil {
+		c.logger.Error().
+			Err(err).
+			Str("user_id", userID.String()).
+			Msg("failed to write user avatar response")
+	}
 }
