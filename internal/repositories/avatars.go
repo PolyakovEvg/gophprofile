@@ -137,7 +137,7 @@ func (r *avatarsRepository) GetForUser(
 		"mime_type",
 		"size_bytes",
 		"s3_key",
-		"thumbnail_s3_keys",
+		"COALESCE(thumbnail_s3_keys, '{}'::jsonb)",
 		"upload_status",
 		"processing_status",
 		"created_at",
@@ -195,7 +195,7 @@ func (r *avatarsRepository) GetByID(
 		"mime_type",
 		"size_bytes",
 		"s3_key",
-		"thumbnail_s3_keys",
+		"COALESCE(thumbnail_s3_keys, '{}'::jsonb)",
 		"upload_status",
 		"processing_status",
 		"created_at",
@@ -252,7 +252,7 @@ func (r *avatarsRepository) Update(
 		Where(squirrel.Eq{"id": id, "deleted_at": nil}).
 		Suffix(
 			"RETURNING user_id, file_name, mime_type, size_bytes, s3_key, " +
-				"thumbnail_s3_keys, upload_status, processing_status, " +
+				"COALESCE(thumbnail_s3_keys, '{}'::jsonb), upload_status, processing_status, " +
 				"created_at, updated_at",
 		).
 		ToSql()
