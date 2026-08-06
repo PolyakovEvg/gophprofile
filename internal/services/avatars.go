@@ -139,6 +139,11 @@ type AvatarsService interface {
 		ctx context.Context,
 		id uuid.UUID,
 	) (*GetMetadataResult, error)
+	// GetByUserID returns the latest avatar media type and raw bytes.
+	GetByUserID(
+		ctx context.Context,
+		userID uuid.UUID,
+	) (string, []byte, error)
 	// DeleteByID deletes an avatar if it belongs to the user.
 	DeleteByID(
 		ctx context.Context,
@@ -361,6 +366,33 @@ func (s *avatarsService) GetMetadataByID(
 		UpdatedAt:        avatar.UpdatedAt,
 	}
 	return &result, nil
+}
+
+func (s *avatarsService) GetByUserID(
+	ctx context.Context,
+	userID uuid.UUID,
+) (string, []byte, error) {
+	avatars, err := s.avatarsRepository.GetForUser(ctx, userID)
+	if err != nil {
+		s.logger.Error().Err(err).
+			Str("user_id", userID.String()).
+			Msg("failed to retrieve user avatars")
+		return "", nil, ErrAvatarQueryFailed
+	}
+	if len(avatars) == 0 {
+		return "", nil, ErrAvatarNotFound
+	}
+
+	avatar := avatars[0]
+	avatarBytes, err := s.storage.Retrieve(ctx, avatar.S3Key)
+	if err != nil {
+		s.logger.Error().Err(err).
+			Str("user_id", userID.String()).
+			Msg("failed to retrieve last avatar")
+		return "", nil, ErrAvatarQueryFailed
+	}
+
+	return avatar.MimeType, avatarBytes, nil
 }
 
 func (s *avatarsService) DeleteByID(

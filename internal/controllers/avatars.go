@@ -198,3 +198,29 @@ func (c *AvatarsController) Delete(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(http.StatusNoContent)
 }
+
+// GetUserAvatar handles requests for the current user's latest avatar.
+func (c *AvatarsController) GetUserAvatar(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	userID, err := uuid.Parse(r.Header.Get("X-User-ID"))
+	if err != nil {
+		WriteError(w, http.StatusBadRequest, "Invalid user ID.")
+		return
+	}
+
+	mimeType, avatarBytes, err := c.avatarsService.GetByUserID(
+		r.Context(),
+		userID,
+	)
+	if err != nil {
+		WriteError(w, http.StatusInternalServerError, "Failed to retrieve avatar.")
+		return
+	}
+
+	w.Header().Set("Content-Type", mimeType)
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	w.WriteHeader(http.StatusOK)
+	w.Write(avatarBytes)
+}
