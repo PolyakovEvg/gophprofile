@@ -140,7 +140,9 @@ func newRouter(
 		router.Get("/avatars/{avatarID}", avatarsController.GetByID)
 		router.Get("/avatars/{avatarID}/metadata", avatarsController.GetMetadata)
 		router.Delete("/avatars/{avatarID}", avatarsController.Delete)
-		router.Get("/users/me/avatar", avatarsController.GetUserAvatar)
+		router.Get("/users/{userID}/avatar", avatarsController.GetUserAvatar)
+		router.Delete("/users/{userID}/avatar", avatarsController.DeleteUserAvatar)
+		router.Get("/users/{userID}/avatars", avatarsController.ListUserAvatars)
 	})
 
 	return router

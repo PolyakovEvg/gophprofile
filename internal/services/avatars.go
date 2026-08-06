@@ -145,11 +145,23 @@ type AvatarsService interface {
 		ctx context.Context,
 		userID uuid.UUID,
 	) (string, []byte, error)
+	// ListForUser returns metadata for every avatar owned by the user.
+	ListForUser(
+		ctx context.Context,
+		userID uuid.UUID,
+	) ([]GetMetadataResult, error)
 	// DeleteByID deletes an avatar if it belongs to the user.
 	DeleteByID(
 		ctx context.Context,
 		id uuid.UUID,
 		userID uuid.UUID,
+	) error
+	// DeleteLatestForUser deletes the user's most recent avatar if the
+	// requester owns it.
+	DeleteLatestForUser(
+		ctx context.Context,
+		userID uuid.UUID,
+		requesterID uuid.UUID,
 	) error
 	// CompleteResize stores generated thumbnail keys and marks processing done.
 	CompleteResize(ctx context.Context, message pkg.MessageResizeDone) error
@@ -413,6 +425,38 @@ func (s *avatarsService) GetByUserID(
 	return avatar.MimeType, avatarBytes, nil
 }
 
+func (s *avatarsService) ListForUser(
+	ctx context.Context,
+	userID uuid.UUID,
+) ([]GetMetadataResult, error) {
+	avatars, err := s.avatarsRepository.GetForUser(ctx, userID)
+	if err != nil {
+		s.logger.Error().Err(err).
+			Str("user_id", userID.String()).
+			Msg("failed to list user avatars")
+		return nil, ErrAvatarQueryFailed
+	}
+
+	results := make([]GetMetadataResult, 0, len(avatars))
+	for _, avatar := range avatars {
+		results = append(results, GetMetadataResult{
+			ID:               avatar.ID,
+			UserID:           avatar.UserID,
+			FileName:         avatar.FileName,
+			MimeType:         avatar.MimeType,
+			SizeBytes:        avatar.SizeBytes,
+			S3Key:            avatar.S3Key,
+			ThumbnailS3Keys:  avatar.ThumbnailS3Keys,
+			UploadStatus:     avatar.UploadStatus,
+			ProcessingStatus: avatar.ProcessingStatus,
+			CreatedAt:        avatar.CreatedAt,
+			UpdatedAt:        avatar.UpdatedAt,
+		})
+	}
+
+	return results, nil
+}
+
 func (s *avatarsService) DeleteByID(
 	ctx context.Context,
 	id uuid.UUID,
@@ -454,6 +498,29 @@ func (s *avatarsService) DeleteByID(
 	}
 
 	return nil
+}
+
+func (s *avatarsService) DeleteLatestForUser(
+	ctx context.Context,
+	userID uuid.UUID,
+	requesterID uuid.UUID,
+) error {
+	if userID != requesterID {
+		return ErrAvatarDeletionForbidden
+	}
+
+	avatars, err := s.avatarsRepository.GetForUser(ctx, userID)
+	if err != nil {
+		s.logger.Error().Err(err).
+			Str("user_id", userID.String()).
+			Msg("failed to look up user avatars for deletion")
+		return ErrAvatarQueryFailed
+	}
+	if len(avatars) == 0 {
+		return ErrAvatarNotFound
+	}
+
+	return s.DeleteByID(ctx, avatars[0].ID, requesterID)
 }
 
 func (s *avatarsService) CompleteResize(

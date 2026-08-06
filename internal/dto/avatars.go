@@ -33,6 +33,22 @@ type AvatarCreatedResponse struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
+// ErrorResponse is the standard JSON error body returned by the API.
+type ErrorResponse struct {
+	// Error is a short, human-readable error message.
+	Error string `json:"error"`
+	// Details gives additional context about the error, if any.
+	Details string `json:"details,omitempty"`
+}
+
+// FileTooLargeResponse is returned when an uploaded file exceeds the size limit.
+type FileTooLargeResponse struct {
+	// Error is a short, human-readable error message.
+	Error string `json:"error"`
+	// MaxSize is the maximum accepted file size, in bytes.
+	MaxSize int64 `json:"max_size"`
+}
+
 // AvatarMetadataResponse is returned for avatar metadata requests.
 type AvatarMetadataResponse struct {
 	// ID is the avatar identifier.

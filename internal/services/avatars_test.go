@@ -494,6 +494,127 @@ func TestAvatarsServiceDeleteByIDRejectsWrongOwner(t *testing.T) {
 	}
 }
 
+func TestAvatarsServiceListForUserReturnsMetadata(t *testing.T) {
+	ctx := context.Background()
+	userID := uuid.MustParse("11111111-1111-1111-1111-111111111111")
+	avatarID := uuid.MustParse("22222222-2222-2222-2222-222222222222")
+
+	repository := &fakeAvatarsRepository{
+		record: &models.Avatar{
+			ID:       avatarID,
+			UserID:   userID,
+			FileName: "avatar.png",
+			MimeType: "image/png",
+			S3Key:    "avatars/source/original.png",
+		},
+	}
+	service := NewAvatarsService(
+		zerolog.Nop(),
+		repository,
+		&fakeStorage{},
+		&fakeQueue{},
+	)
+
+	results, err := service.ListForUser(ctx, userID)
+	if err != nil {
+		t.Fatalf("ListForUser returned error: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected 1 avatar, got %d", len(results))
+	}
+	if results[0].ID != avatarID {
+		t.Fatalf("expected avatar ID %s, got %s", avatarID, results[0].ID)
+	}
+}
+
+func TestAvatarsServiceListForUserReturnsEmptyForUnknownUser(t *testing.T) {
+	ctx := context.Background()
+	service := NewAvatarsService(
+		zerolog.Nop(),
+		&fakeAvatarsRepository{},
+		&fakeStorage{},
+		&fakeQueue{},
+	)
+
+	results, err := service.ListForUser(ctx, uuid.New())
+	if err != nil {
+		t.Fatalf("ListForUser returned error: %v", err)
+	}
+	if len(results) != 0 {
+		t.Fatalf("expected 0 avatars, got %d", len(results))
+	}
+}
+
+func TestAvatarsServiceDeleteLatestForUserQueuesStorageDeletion(t *testing.T) {
+	ctx := context.Background()
+	userID := uuid.MustParse("11111111-1111-1111-1111-111111111111")
+	avatarID := uuid.MustParse("22222222-2222-2222-2222-222222222222")
+
+	repository := &fakeAvatarsRepository{
+		record: &models.Avatar{
+			ID:     avatarID,
+			UserID: userID,
+			S3Key:  "avatars/source/original.png",
+		},
+	}
+	queueProvider := &fakeQueue{}
+	service := NewAvatarsService(
+		zerolog.Nop(),
+		repository,
+		&fakeStorage{},
+		queueProvider,
+	)
+
+	if err := service.DeleteLatestForUser(ctx, userID, userID); err != nil {
+		t.Fatalf("DeleteLatestForUser returned error: %v", err)
+	}
+	if !reflect.DeepEqual(repository.deleted, []uuid.UUID{avatarID}) {
+		t.Fatalf("unexpected repository deletes: %#v", repository.deleted)
+	}
+	if len(queueProvider.deleteJobs) != 1 {
+		t.Fatalf("expected 1 delete job, got %d", len(queueProvider.deleteJobs))
+	}
+}
+
+func TestAvatarsServiceDeleteLatestForUserRejectsWrongRequester(t *testing.T) {
+	ctx := context.Background()
+	userID := uuid.MustParse("11111111-1111-1111-1111-111111111111")
+	requesterID := uuid.MustParse("33333333-3333-3333-3333-333333333333")
+
+	repository := &fakeAvatarsRepository{}
+	service := NewAvatarsService(
+		zerolog.Nop(),
+		repository,
+		&fakeStorage{},
+		&fakeQueue{},
+	)
+
+	err := service.DeleteLatestForUser(ctx, userID, requesterID)
+	if !errors.Is(err, ErrAvatarDeletionForbidden) {
+		t.Fatalf("expected ErrAvatarDeletionForbidden, got %v", err)
+	}
+	if len(repository.deleted) != 0 {
+		t.Fatalf("expected no repository deletes, got %d", len(repository.deleted))
+	}
+}
+
+func TestAvatarsServiceDeleteLatestForUserRequiresExistingAvatar(t *testing.T) {
+	ctx := context.Background()
+	userID := uuid.New()
+
+	service := NewAvatarsService(
+		zerolog.Nop(),
+		&fakeAvatarsRepository{},
+		&fakeStorage{},
+		&fakeQueue{},
+	)
+
+	err := service.DeleteLatestForUser(ctx, userID, userID)
+	if !errors.Is(err, ErrAvatarNotFound) {
+		t.Fatalf("expected ErrAvatarNotFound, got %v", err)
+	}
+}
+
 func TestAvatarsServiceCompleteResizeUpdatesRepository(t *testing.T) {
 	ctx := context.Background()
 	avatarID := uuid.MustParse("22222222-2222-2222-2222-222222222222")

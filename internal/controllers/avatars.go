@@ -26,9 +26,15 @@ func WriteJSON(w http.ResponseWriter, code int, payload any) {
 	}
 }
 
-// WriteError writes a JSON error response with a message field.
+// WriteError writes a JSON error response with an "error" field.
 func WriteError(w http.ResponseWriter, code int, message string) {
-	WriteJSON(w, code, map[string]string{"message": message})
+	WriteJSON(w, code, dto.ErrorResponse{Error: message})
+}
+
+// WriteErrorDetails writes a JSON error response with "error" and
+// "details" fields.
+func WriteErrorDetails(w http.ResponseWriter, code int, message, details string) {
+	WriteJSON(w, code, dto.ErrorResponse{Error: message, Details: details})
 }
 
 // AvatarsController handles avatar HTTP requests.
@@ -78,7 +84,10 @@ func (c *AvatarsController) Upload(w http.ResponseWriter, r *http.Request) {
 	)
 	if err != nil {
 		if errors.Is(err, services.ErrFileTooLarge) {
-			WriteError(w, http.StatusRequestEntityTooLarge, "File too large.")
+			WriteJSON(w, http.StatusRequestEntityTooLarge, dto.FileTooLargeResponse{
+				Error:   "File too large.",
+				MaxSize: uploadFormSize,
+			})
 			return
 		}
 		if errors.Is(err, services.ErrInvalidFile) {
@@ -86,7 +95,12 @@ func (c *AvatarsController) Upload(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if errors.Is(err, services.ErrUnsupportedFile) {
-			WriteError(w, http.StatusBadRequest, "Invalid file format.")
+			WriteErrorDetails(
+				w,
+				http.StatusBadRequest,
+				"Invalid file format.",
+				"Supported formats: jpeg, png, webp",
+			)
 			return
 		}
 		WriteError(w, http.StatusInternalServerError, "Failed to process the file.")
@@ -158,7 +172,13 @@ func (c *AvatarsController) GetMetadata(
 		return
 	}
 
-	WriteJSON(w, http.StatusOK, dto.AvatarMetadataResponse{
+	WriteJSON(w, http.StatusOK, toAvatarMetadataResponse(avatar))
+}
+
+func toAvatarMetadataResponse(
+	avatar *services.GetMetadataResult,
+) dto.AvatarMetadataResponse {
+	return dto.AvatarMetadataResponse{
 		ID:               avatar.ID,
 		UserID:           avatar.UserID,
 		FileName:         avatar.FileName,
@@ -170,7 +190,7 @@ func (c *AvatarsController) GetMetadata(
 		ProcessingStatus: avatar.ProcessingStatus,
 		CreatedAt:        avatar.CreatedAt,
 		UpdatedAt:        avatar.UpdatedAt,
-	})
+	}
 }
 
 // Delete handles avatar deletion requests.
@@ -204,12 +224,12 @@ func (c *AvatarsController) Delete(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// GetUserAvatar handles requests for the current user's latest avatar.
+// GetUserAvatar handles requests for a user's latest avatar.
 func (c *AvatarsController) GetUserAvatar(
 	w http.ResponseWriter,
 	r *http.Request,
 ) {
-	userID, err := uuid.Parse(r.Header.Get("X-User-ID"))
+	userID, err := uuid.Parse(chi.URLParam(r, "userID"))
 	if err != nil {
 		WriteError(w, http.StatusBadRequest, "Invalid user ID.")
 		return
@@ -220,6 +240,10 @@ func (c *AvatarsController) GetUserAvatar(
 		userID,
 	)
 	if err != nil {
+		if errors.Is(err, services.ErrAvatarNotFound) {
+			WriteError(w, http.StatusNotFound, "Avatar not found.")
+			return
+		}
 		WriteError(w, http.StatusInternalServerError, "Failed to retrieve avatar.")
 		return
 	}
@@ -233,4 +257,63 @@ func (c *AvatarsController) GetUserAvatar(
 			Str("user_id", userID.String()).
 			Msg("failed to write user avatar response")
 	}
+}
+
+// DeleteUserAvatar handles requests to delete a user's latest avatar.
+func (c *AvatarsController) DeleteUserAvatar(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	userID, err := uuid.Parse(chi.URLParam(r, "userID"))
+	if err != nil {
+		WriteError(w, http.StatusBadRequest, "Invalid user ID.")
+		return
+	}
+
+	requesterID, err := uuid.Parse(r.Header.Get("X-User-ID"))
+	if err != nil {
+		WriteError(w, http.StatusBadRequest, "Invalid user ID.")
+		return
+	}
+
+	err = c.avatarsService.DeleteLatestForUser(r.Context(), userID, requesterID)
+	if err != nil {
+		if errors.Is(err, services.ErrAvatarDeletionForbidden) {
+			WriteError(w, http.StatusForbidden, "You can only delete your own avatars.")
+			return
+		}
+		if errors.Is(err, services.ErrAvatarNotFound) {
+			WriteError(w, http.StatusNotFound, "Avatar not found.")
+			return
+		}
+		WriteError(w, http.StatusInternalServerError, "Failed to delete avatar.")
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// ListUserAvatars handles requests for the list of a user's avatars.
+func (c *AvatarsController) ListUserAvatars(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	userID, err := uuid.Parse(chi.URLParam(r, "userID"))
+	if err != nil {
+		WriteError(w, http.StatusBadRequest, "Invalid user ID.")
+		return
+	}
+
+	avatars, err := c.avatarsService.ListForUser(r.Context(), userID)
+	if err != nil {
+		WriteError(w, http.StatusInternalServerError, "Failed to list avatars.")
+		return
+	}
+
+	response := make([]dto.AvatarMetadataResponse, 0, len(avatars))
+	for _, avatar := range avatars {
+		response = append(response, toAvatarMetadataResponse(&avatar))
+	}
+
+	WriteJSON(w, http.StatusOK, response)
 }

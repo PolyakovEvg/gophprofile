@@ -13,6 +13,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/pelfox/gophprofile/internal/dto"
 	"github.com/pelfox/gophprofile/internal/models"
 	"github.com/pelfox/gophprofile/internal/services"
 	"github.com/pelfox/gophprofile/pkg"
@@ -39,6 +40,14 @@ type fakeAvatarsService struct {
 	getByUserIDMimeType string
 	getByUserIDPayload  []byte
 	getByUserIDErr      error
+
+	listForUserID     uuid.UUID
+	listForUserResult []services.GetMetadataResult
+	listForUserErr    error
+
+	deleteLatestUserID      uuid.UUID
+	deleteLatestRequesterID uuid.UUID
+	deleteLatestErr         error
 }
 
 func (s *fakeAvatarsService) Create(
@@ -96,6 +105,28 @@ func (s *fakeAvatarsService) DeleteByID(
 	s.deleteAvatarID = id
 	s.deleteUserID = userID
 	return s.deleteErr
+}
+
+func (s *fakeAvatarsService) ListForUser(
+	ctx context.Context,
+	userID uuid.UUID,
+) ([]services.GetMetadataResult, error) {
+	s.listForUserID = userID
+	if s.listForUserErr != nil {
+		return nil, s.listForUserErr
+	}
+
+	return s.listForUserResult, nil
+}
+
+func (s *fakeAvatarsService) DeleteLatestForUser(
+	ctx context.Context,
+	userID uuid.UUID,
+	requesterID uuid.UUID,
+) error {
+	s.deleteLatestUserID = userID
+	s.deleteLatestRequesterID = requesterID
+	return s.deleteLatestErr
 }
 
 func (s *fakeAvatarsService) CompleteResize(
@@ -204,22 +235,10 @@ func TestAvatarsControllerUploadMapsServiceErrors(t *testing.T) {
 		wantBody   string
 	}{
 		{
-			name:       "file too large",
-			err:        services.ErrFileTooLarge,
-			wantStatus: http.StatusRequestEntityTooLarge,
-			wantBody:   "File too large.",
-		},
-		{
 			name:       "invalid file",
 			err:        services.ErrInvalidFile,
 			wantStatus: http.StatusUnprocessableEntity,
 			wantBody:   "Unprocessable file.",
-		},
-		{
-			name:       "unsupported file",
-			err:        services.ErrUnsupportedFile,
-			wantStatus: http.StatusBadRequest,
-			wantBody:   "Invalid file format.",
 		},
 		{
 			name:       "unexpected",
@@ -243,6 +262,58 @@ func TestAvatarsControllerUploadMapsServiceErrors(t *testing.T) {
 			}
 			assertMessage(t, rec.Body.Bytes(), tt.wantBody)
 		})
+	}
+}
+
+func TestAvatarsControllerUploadFileTooLargeReturnsMaxSize(t *testing.T) {
+	service := &fakeAvatarsService{createErr: services.ErrFileTooLarge}
+	controller := NewAvatarsController(zerolog.Nop(), service)
+	req := multipartRequest(t, uuid.NewString(), "avatar_file", []byte("payload"))
+	rec := httptest.NewRecorder()
+
+	controller.Upload(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf(
+			"expected status %d, got %d",
+			http.StatusRequestEntityTooLarge,
+			rec.Code,
+		)
+	}
+
+	var response dto.FileTooLargeResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("failed to decode error response: %v", err)
+	}
+	if response.Error != "File too large." {
+		t.Fatalf("unexpected error message: %q", response.Error)
+	}
+	if response.MaxSize != uploadFormSize {
+		t.Fatalf("expected max_size %d, got %d", uploadFormSize, response.MaxSize)
+	}
+}
+
+func TestAvatarsControllerUploadUnsupportedFileReturnsDetails(t *testing.T) {
+	service := &fakeAvatarsService{createErr: services.ErrUnsupportedFile}
+	controller := NewAvatarsController(zerolog.Nop(), service)
+	req := multipartRequest(t, uuid.NewString(), "avatar_file", []byte("payload"))
+	rec := httptest.NewRecorder()
+
+	controller.Upload(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected status %d, got %d", http.StatusBadRequest, rec.Code)
+	}
+
+	var response dto.ErrorResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("failed to decode error response: %v", err)
+	}
+	if response.Error != "Invalid file format." {
+		t.Fatalf("unexpected error message: %q", response.Error)
+	}
+	if response.Details != "Supported formats: jpeg, png, webp" {
+		t.Fatalf("unexpected details: %q", response.Details)
 	}
 }
 
@@ -387,6 +458,164 @@ func TestAvatarsControllerDeleteMapsResponses(t *testing.T) {
 	}
 }
 
+func TestAvatarsControllerGetUserAvatarReturnsAvatarBytes(t *testing.T) {
+	userID := uuid.MustParse("11111111-1111-1111-1111-111111111111")
+	service := &fakeAvatarsService{
+		getByUserIDMimeType: "image/png",
+		getByUserIDPayload:  []byte("avatar"),
+	}
+	controller := NewAvatarsController(zerolog.Nop(), service)
+
+	req := requestWithUserID(
+		http.MethodGet,
+		"/users/"+userID.String()+"/avatar",
+		userID.String(),
+	)
+	rec := httptest.NewRecorder()
+	controller.GetUserAvatar(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, rec.Code)
+	}
+	if rec.Header().Get("Content-Type") != "image/png" {
+		t.Fatalf("unexpected content type: %s", rec.Header().Get("Content-Type"))
+	}
+	if rec.Body.String() != "avatar" {
+		t.Fatalf("expected avatar body, got %q", rec.Body.String())
+	}
+}
+
+func TestAvatarsControllerGetUserAvatarNotFound(t *testing.T) {
+	userID := uuid.MustParse("11111111-1111-1111-1111-111111111111")
+	service := &fakeAvatarsService{getByUserIDErr: services.ErrAvatarNotFound}
+	controller := NewAvatarsController(zerolog.Nop(), service)
+
+	req := requestWithUserID(
+		http.MethodGet,
+		"/users/"+userID.String()+"/avatar",
+		userID.String(),
+	)
+	rec := httptest.NewRecorder()
+	controller.GetUserAvatar(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected status %d, got %d", http.StatusNotFound, rec.Code)
+	}
+	assertMessage(t, rec.Body.Bytes(), "Avatar not found.")
+}
+
+func TestAvatarsControllerDeleteUserAvatarMapsResponses(t *testing.T) {
+	userID := uuid.MustParse("11111111-1111-1111-1111-111111111111")
+
+	tests := []struct {
+		name       string
+		err        error
+		wantStatus int
+		wantBody   string
+	}{
+		{
+			name:       "success",
+			wantStatus: http.StatusNoContent,
+		},
+		{
+			name:       "forbidden",
+			err:        services.ErrAvatarDeletionForbidden,
+			wantStatus: http.StatusForbidden,
+			wantBody:   "You can only delete your own avatars.",
+		},
+		{
+			name:       "not found",
+			err:        services.ErrAvatarNotFound,
+			wantStatus: http.StatusNotFound,
+			wantBody:   "Avatar not found.",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			service := &fakeAvatarsService{deleteLatestErr: tt.err}
+			controller := NewAvatarsController(zerolog.Nop(), service)
+			req := requestWithUserID(
+				http.MethodDelete,
+				"/users/"+userID.String()+"/avatar",
+				userID.String(),
+			)
+			req.Header.Set("X-User-ID", userID.String())
+			rec := httptest.NewRecorder()
+
+			controller.DeleteUserAvatar(rec, req)
+
+			if rec.Code != tt.wantStatus {
+				t.Fatalf("expected status %d, got %d", tt.wantStatus, rec.Code)
+			}
+			if service.deleteLatestUserID != userID {
+				t.Fatalf(
+					"expected user ID %s, got %s",
+					userID,
+					service.deleteLatestUserID,
+				)
+			}
+			if service.deleteLatestRequesterID != userID {
+				t.Fatalf(
+					"expected requester ID %s, got %s",
+					userID,
+					service.deleteLatestRequesterID,
+				)
+			}
+			if tt.wantBody != "" {
+				assertMessage(t, rec.Body.Bytes(), tt.wantBody)
+			}
+		})
+	}
+}
+
+func TestAvatarsControllerListUserAvatarsReturnsJSON(t *testing.T) {
+	userID := uuid.MustParse("11111111-1111-1111-1111-111111111111")
+	avatarID := uuid.MustParse("22222222-2222-2222-2222-222222222222")
+
+	service := &fakeAvatarsService{
+		listForUserResult: []services.GetMetadataResult{
+			{
+				ID:               avatarID,
+				UserID:           userID,
+				FileName:         "avatar.png",
+				MimeType:         "image/png",
+				SizeBytes:        7,
+				S3Key:            "avatars/source/original.png",
+				UploadStatus:     models.UploadStatusCompleted,
+				ProcessingStatus: models.ProcessingStatusCompleted,
+			},
+		},
+	}
+	controller := NewAvatarsController(zerolog.Nop(), service)
+
+	req := requestWithUserID(
+		http.MethodGet,
+		"/users/"+userID.String()+"/avatars",
+		userID.String(),
+	)
+	rec := httptest.NewRecorder()
+	controller.ListUserAvatars(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, rec.Code)
+	}
+	if service.listForUserID != userID {
+		t.Fatalf("expected list user ID %s, got %s", userID, service.listForUserID)
+	}
+
+	var response []map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if len(response) != 1 {
+		t.Fatalf("expected 1 avatar, got %d", len(response))
+	}
+	if response[0]["id"] != avatarID.String() {
+		t.Fatalf("expected avatar ID %s, got %#v", avatarID, response[0]["id"])
+	}
+}
+
 func multipartRequest(
 	t *testing.T,
 	userID string,
@@ -425,6 +654,17 @@ func requestWithAvatarID(method string, target string, avatarID string) *http.Re
 	))
 }
 
+func requestWithUserID(method string, target string, userID string) *http.Request {
+	req := httptest.NewRequest(method, target, nil)
+	routeContext := chi.NewRouteContext()
+	routeContext.URLParams.Add("userID", userID)
+	return req.WithContext(context.WithValue(
+		req.Context(),
+		chi.RouteCtxKey,
+		routeContext,
+	))
+}
+
 func assertMessage(t *testing.T, payload []byte, message string) {
 	t.Helper()
 
@@ -432,7 +672,7 @@ func assertMessage(t *testing.T, payload []byte, message string) {
 	if err := json.Unmarshal(payload, &response); err != nil {
 		t.Fatalf("failed to decode error response: %v", err)
 	}
-	if response["message"] != message {
-		t.Fatalf("expected message %q, got %q", message, response["message"])
+	if response["error"] != message {
+		t.Fatalf("expected error %q, got %q", message, response["error"])
 	}
 }
