@@ -11,6 +11,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pelfox/gophprofile/internal/config"
@@ -57,27 +59,47 @@ func Run(logger zerolog.Logger, cfg *config.AppConfig) error {
 	}
 	defer queueProvider.Close()
 
+	s3Client := storage.NewS3Client(storage.S3StorageConfig{
+		Region:    cfg.S3Region,
+		Endpoint:  cfg.S3Endpoint,
+		AccessKey: cfg.S3AccessKey,
+		SecretKey: cfg.S3SecretKey,
+		Bucket:    cfg.S3Bucket,
+	})
+
 	avatarsRepository := repositories.NewAvatarsRepository(pool)
 	avatarsService := services.NewAvatarsService(
 		logger,
 		avatarsRepository,
-		storage.NewS3StorageFromConfig(storage.S3StorageConfig{
-			Region:    cfg.S3Region,
-			Endpoint:  cfg.S3Endpoint,
-			AccessKey: cfg.S3AccessKey,
-			SecretKey: cfg.S3SecretKey,
-			Bucket:    cfg.S3Bucket,
-		}),
+		storage.NewS3Storage(s3Client, cfg.S3Bucket, cfg.S3Endpoint),
 		queueProvider,
 	)
 	avatarsController := controllers.NewAvatarsController(
 		logger,
 		avatarsService,
 	)
+	healthController := controllers.NewHealthController(
+		logger,
+		controllers.NewFuncHealthChecker("database", func(ctx context.Context) error {
+			return pool.Ping(ctx)
+		}),
+		controllers.NewFuncHealthChecker("storage", func(ctx context.Context) error {
+			_, err := s3Client.HeadBucket(ctx, &s3.HeadBucketInput{
+				Bucket: aws.String(cfg.S3Bucket),
+			})
+			return err
+		}),
+		controllers.NewFuncHealthChecker("broker", func(_ context.Context) error {
+			if conn.IsClosed() {
+				return errors.New("rabbitmq connection is closed")
+			}
+			return nil
+		}),
+	)
 
 	server := &http.Server{
 		Addr:    cfg.ListenAddr,
-		Handler: newRouter(avatarsController),
+		Handler: newRouter(avatarsController, healthController),
 	}
 
 	errCh := make(chan error, 2)
@@ -104,11 +126,15 @@ func Run(logger zerolog.Logger, cfg *config.AppConfig) error {
 	}
 }
 
-func newRouter(avatarsController *controllers.AvatarsController) http.Handler {
+func newRouter(
+	avatarsController *controllers.AvatarsController,
+	healthController *controllers.HealthController,
+) http.Handler {
 	router := chi.NewRouter()
 	router.Get("/", func(w http.ResponseWriter, r *http.Request) {
 		http.ServeFile(w, r, "web/index.html")
 	})
+	router.Get("/health", healthController.Health)
 	router.Route("/api/v1", func(router chi.Router) {
 		router.Post("/avatars", avatarsController.Upload)
 		router.Get("/avatars/{avatarID}", avatarsController.GetByID)

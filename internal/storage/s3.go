@@ -43,6 +43,14 @@ func NewS3Storage(
 
 // NewS3StorageFromConfig creates an S3-backed provider from storage settings.
 func NewS3StorageFromConfig(cfg S3StorageConfig) Provider {
+	client := NewS3Client(cfg)
+	return NewS3Storage(client, cfg.Bucket, cfg.Endpoint)
+}
+
+// NewS3Client creates an S3 client from storage settings. Exposed
+// separately so callers (e.g. health checks) can reuse the same client
+// without going through the Provider interface.
+func NewS3Client(cfg S3StorageConfig) *s3.Client {
 	awsCfg := aws.Config{
 		Region: cfg.Region,
 	}
@@ -57,7 +65,7 @@ func NewS3StorageFromConfig(cfg S3StorageConfig) Provider {
 		)
 	}
 
-	client := s3.NewFromConfig(awsCfg, func(options *s3.Options) {
+	return s3.NewFromConfig(awsCfg, func(options *s3.Options) {
 		if cfg.Endpoint == "" {
 			return
 		}
@@ -65,8 +73,6 @@ func NewS3StorageFromConfig(cfg S3StorageConfig) Provider {
 		options.BaseEndpoint = aws.String(cfg.Endpoint)
 		options.UsePathStyle = true
 	})
-
-	return NewS3Storage(client, cfg.Bucket, cfg.Endpoint)
 }
 
 func (s *s3Storage) Store(
