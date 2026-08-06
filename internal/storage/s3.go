@@ -76,3 +76,21 @@ func (s *s3Storage) Retrieve(ctx context.Context, key string) ([]byte, error) {
 
 	return payload, nil
 }
+
+func (s *s3Storage) Delete(ctx context.Context, keys []string) error {
+	for _, key := range keys {
+		if key == "" {
+			continue
+		}
+
+		_, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{
+			Bucket: aws.String(s.bucket),
+			Key:    aws.String(key),
+		})
+		if err != nil {
+			return fmt.Errorf("failed to delete avatar from S3: %w", err)
+		}
+	}
+
+	return nil
+}

@@ -7,6 +7,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"path"
 	"slices"
 	"time"
 
@@ -150,13 +151,15 @@ type AvatarsService interface {
 		id uuid.UUID,
 		userID uuid.UUID,
 	) error
+	// CompleteResize stores generated thumbnail keys and marks processing done.
+	CompleteResize(ctx context.Context, message pkg.MessageResizeDone) error
 }
 
 type avatarsService struct {
 	logger            zerolog.Logger
 	avatarsRepository repositories.AvatarsRepository
 	storage           storage.Provider
-	queue             queue.Provider
+	queue             queue.PublisherProvider
 }
 
 // NewAvatarsService creates an avatar service.
@@ -164,7 +167,7 @@ func NewAvatarsService(
 	logger zerolog.Logger,
 	avatarsRepository repositories.AvatarsRepository,
 	storage storage.Provider,
-	queue queue.Provider,
+	queue queue.PublisherProvider,
 ) AvatarsService {
 	return &avatarsService{
 		logger:            logger.With().Str("service", "avatars").Logger(),
@@ -272,8 +275,22 @@ func (s *avatarsService) Create(
 		return nil, ErrUploadFailed
 	}
 
+	newProcessingStatus := models.ProcessingStatusProcessing
+	avatar, err = s.avatarsRepository.Update(
+		ctx,
+		avatar.ID,
+		repositories.UpdateAvatarInput{
+			ProcessingStatus: &newProcessingStatus,
+		},
+	)
+	if err != nil {
+		logger.Error().Err(err).Msg("failed to update processing status")
+		return nil, ErrUploadFailed
+	}
+
 	err = s.queue.RequestResize(ctx, pkg.MessageResizeRequest{
 		ID:       avatar.ID,
+		UserID:   avatar.UserID,
 		FileName: fileName,
 		Key:      fileKey,
 	})
@@ -424,5 +441,64 @@ func (s *avatarsService) DeleteByID(
 		return ErrAvatarDeletionFailed
 	}
 
+	if err := s.queue.RequestDelete(ctx, pkg.MessageDeleteRequest{
+		ID:   id,
+		Keys: getAvatarStorageKeys(avatar),
+	}); err != nil {
+		s.logger.Error().Err(err).
+			Str("user_id", userID.String()).
+			Str("id", id.String()).
+			Msg("failed to queue avatar storage deletion")
+		return ErrAvatarDeletionFailed
+	}
+
 	return nil
+}
+
+func (s *avatarsService) CompleteResize(
+	ctx context.Context,
+	message pkg.MessageResizeDone,
+) error {
+	thumbnailKeys := models.ThumbnailS3Keys{
+		Size100x100: message.ThumbnailS3Keys.Size100x100,
+		Size300x300: message.ThumbnailS3Keys.Size300x300,
+	}
+	processingStatus := models.ProcessingStatusCompleted
+
+	_, err := s.avatarsRepository.Update(
+		ctx,
+		message.ID,
+		repositories.UpdateAvatarInput{
+			ThumbnailS3Keys:  &thumbnailKeys,
+			ProcessingStatus: &processingStatus,
+		},
+	)
+	if err != nil {
+		if errors.Is(err, repositories.ErrAvatarNotFound) {
+			return ErrAvatarNotFound
+		}
+
+		s.logger.Error().Err(err).
+			Str("avatar_id", message.ID.String()).
+			Msg("failed to complete avatar resize")
+		return ErrUploadFailed
+	}
+
+	return nil
+}
+
+func getAvatarStorageKeys(avatar *models.Avatar) []string {
+	keys := []string{avatar.S3Key}
+	if avatar.ThumbnailS3Keys.Size100x100 != "" {
+		keys = append(keys, avatar.ThumbnailS3Keys.Size100x100)
+	} else {
+		keys = append(keys, path.Join(path.Dir(avatar.S3Key), "100x100.jpg"))
+	}
+	if avatar.ThumbnailS3Keys.Size300x300 != "" {
+		keys = append(keys, avatar.ThumbnailS3Keys.Size300x300)
+	} else {
+		keys = append(keys, path.Join(path.Dir(avatar.S3Key), "300x300.jpg"))
+	}
+
+	return keys
 }

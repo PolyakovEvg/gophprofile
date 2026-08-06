@@ -27,4 +27,6 @@ type Provider interface {
 	Store(ctx context.Context, input StoreInput) (string, error)
 	// Retrieve loads an avatar object by storage key.
 	Retrieve(ctx context.Context, key string) ([]byte, error)
+	// Delete removes avatar objects by storage key.
+	Delete(ctx context.Context, keys []string) error
 }
