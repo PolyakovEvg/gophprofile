@@ -43,8 +43,6 @@ func (c *FuncHealthChecker) Check(ctx context.Context) error {
 type componentStatus struct {
 	// Status is either "ok" or "error".
 	Status string `json:"status"`
-	// Error describes the failure, if any.
-	Error string `json:"error,omitempty"`
 }
 
 // healthResponse is the JSON body returned by the health endpoint.
@@ -80,10 +78,7 @@ func (c *HealthController) Health(w http.ResponseWriter, r *http.Request) {
 	for _, checker := range c.checkers {
 		if err := checker.Check(r.Context()); err != nil {
 			healthy = false
-			components[checker.Name()] = componentStatus{
-				Status: "error",
-				Error:  err.Error(),
-			}
+			components[checker.Name()] = componentStatus{Status: "error"}
 			c.logger.Error().
 				Err(err).
 				Str("component", checker.Name()).

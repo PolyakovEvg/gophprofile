@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,16 +15,22 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/go-chi/chi/v5"
+	"github.com/golang-migrate/migrate/v4"
+	migratepgx "github.com/golang-migrate/migrate/v4/database/pgx/v5"
+	"github.com/golang-migrate/migrate/v4/source/iofs"
 	"github.com/jackc/pgx/v5/pgxpool"
+	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/pelfox/gophprofile/internal/config"
 	"github.com/pelfox/gophprofile/internal/controllers"
 	"github.com/pelfox/gophprofile/internal/queue"
 	"github.com/pelfox/gophprofile/internal/repositories"
 	"github.com/pelfox/gophprofile/internal/services"
 	"github.com/pelfox/gophprofile/internal/storage"
+	"github.com/pelfox/gophprofile/migrations"
 	"github.com/pelfox/gophprofile/pkg"
 	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/rs/zerolog"
+	"golang.org/x/sync/errgroup"
 )
 
 const shutdownTimeout = 10 * time.Second
@@ -45,6 +52,10 @@ func Run(logger zerolog.Logger, cfg *config.AppConfig) error {
 
 	if err := pool.Ping(ctx); err != nil {
 		return fmt.Errorf("failed to connect to database: %w", err)
+	}
+
+	if err := runMigrations(cfg.DatabaseURL); err != nil {
+		return fmt.Errorf("failed to apply database migrations: %w", err)
 	}
 
 	conn, err := amqp.Dial(cfg.RabbitMQURL)
@@ -102,28 +113,25 @@ func Run(logger zerolog.Logger, cfg *config.AppConfig) error {
 		Handler: newRouter(avatarsController, healthController),
 	}
 
-	errCh := make(chan error, 2)
-	go func() {
-		errCh <- consumeResizeDoneQueue(ctx, logger, conn, avatarsService)
-	}()
-	go func() {
+	group, groupCtx := errgroup.WithContext(ctx)
+	group.Go(func() error {
+		return consumeResizeDoneQueue(groupCtx, logger, conn, avatarsService)
+	})
+	group.Go(func() error {
 		logger.Info().Str("addr", cfg.ListenAddr).Msg("started HTTP server")
 		if err := server.ListenAndServe(); err != nil &&
 			!errors.Is(err, http.ErrServerClosed) {
-			errCh <- fmt.Errorf("failed to run HTTP server: %w", err)
+			return fmt.Errorf("failed to run HTTP server: %w", err)
 		}
-	}()
+		return nil
+	})
 
-	select {
-	case <-ctx.Done():
-		return shutdownServer(server)
-	case err := <-errCh:
-		stop()
-		if shutdownErr := shutdownServer(server); shutdownErr != nil {
-			return shutdownErr
-		}
+	<-groupCtx.Done()
+	shutdownErr := shutdownServer(server)
+	if err := group.Wait(); err != nil {
 		return err
 	}
+	return shutdownErr
 }
 
 func newRouter(
@@ -222,6 +230,35 @@ func consumeResizeDoneQueue(
 			}
 		}
 	}
+}
+
+func runMigrations(databaseURL string) error {
+	db, err := sql.Open("pgx", databaseURL)
+	if err != nil {
+		return fmt.Errorf("failed to open migration database connection: %w", err)
+	}
+	defer db.Close()
+
+	driver, err := migratepgx.WithInstance(db, &migratepgx.Config{})
+	if err != nil {
+		return fmt.Errorf("failed to initialize migration driver: %w", err)
+	}
+
+	source, err := iofs.New(migrations.Files, ".")
+	if err != nil {
+		return fmt.Errorf("failed to load embedded migrations: %w", err)
+	}
+
+	migrator, err := migrate.NewWithInstance("iofs", source, "pgx5", driver)
+	if err != nil {
+		return fmt.Errorf("failed to initialize migrator: %w", err)
+	}
+
+	if err := migrator.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
+		return fmt.Errorf("failed to apply migrations: %w", err)
+	}
+
+	return nil
 }
 
 func shutdownServer(server *http.Server) error {

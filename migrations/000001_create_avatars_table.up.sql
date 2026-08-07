@@ -18,7 +18,7 @@ CREATE TABLE IF NOT EXISTS avatars (
     file_name VARCHAR(255) NOT NULL,
     mime_type VARCHAR(255) NOT NULL,
     size_bytes BIGINT NOT NULL CHECK (size_bytes > 0),
-    s3_key TEXT NOT NULL UNIQUE,
+    s3_key VARCHAR(1024) NOT NULL UNIQUE,
     thumbnail_s3_keys JSONB,
     upload_status upload_status NOT NULL DEFAULT 'PENDING',
     processing_status processing_status NOT NULL DEFAULT 'PENDING',

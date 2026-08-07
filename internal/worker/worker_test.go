@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/pelfox/gophprofile/internal/models"
 	"github.com/pelfox/gophprofile/internal/storage"
 	"github.com/pelfox/gophprofile/pkg"
 	"github.com/rs/zerolog"
@@ -172,7 +173,7 @@ func TestProcessorProcessResizeCreatesThumbnailsAndPublishesCompletion(
 
 	expectedMessage := pkg.MessageResizeDone{
 		ID: request.ID,
-		ThumbnailS3Keys: pkg.ThumbnailS3Keys{
+		ThumbnailS3Keys: models.ThumbnailS3Keys{
 			Size100x100: "avatars/source/100x100.jpg",
 			Size300x300: "avatars/source/300x300.jpg",
 		},

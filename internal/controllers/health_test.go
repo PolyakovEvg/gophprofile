@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/rs/zerolog"
@@ -75,7 +76,13 @@ func TestHealthController_Health_Degraded(t *testing.T) {
 		t.Fatalf("expected database status ok, got %+v", body.Components["database"])
 	}
 	broker := body.Components["broker"]
-	if broker.Status != "error" || broker.Error != "connection refused" {
+	if broker.Status != "error" {
 		t.Fatalf("unexpected broker status: %+v", broker)
+	}
+	if strings.Contains(recorder.Body.String(), "connection refused") {
+		t.Fatalf(
+			"response body must not leak internal error details: %s",
+			recorder.Body.String(),
+		)
 	}
 }

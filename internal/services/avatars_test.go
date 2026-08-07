@@ -332,8 +332,8 @@ func TestAvatarsServiceCreateMarksProcessingFailedWhenResizeQueueFails(t *testin
 	)
 
 	_, err := service.Create(ctx, userID, uploadInput(pngPayload(t)))
-	if !errors.Is(err, ErrUploadFailed) {
-		t.Fatalf("expected ErrUploadFailed, got %v", err)
+	if !errors.Is(err, errUploadFailed) {
+		t.Fatalf("expected errUploadFailed, got %v", err)
 	}
 	if len(repository.updates) == 0 {
 		t.Fatal("expected repository updates")
@@ -631,7 +631,7 @@ func TestAvatarsServiceCompleteResizeUpdatesRepository(t *testing.T) {
 
 	err := service.CompleteResize(ctx, pkg.MessageResizeDone{
 		ID: avatarID,
-		ThumbnailS3Keys: pkg.ThumbnailS3Keys{
+		ThumbnailS3Keys: models.ThumbnailS3Keys{
 			Size100x100: "avatars/source/100x100.jpg",
 			Size300x300: "avatars/source/300x300.jpg",
 		},

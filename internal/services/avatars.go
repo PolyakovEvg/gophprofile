@@ -29,20 +29,20 @@ var (
 	ErrInvalidFile = errors.New("the provided file is invalid")
 	// ErrUnsupportedFile is returned when the file media type is unsupported.
 	ErrUnsupportedFile = errors.New("the provided file is unsupported")
-	// ErrUploadFailed is returned when the upload workflow cannot complete.
-	ErrUploadFailed = errors.New(
+	// errUploadFailed is returned when the upload workflow cannot complete.
+	errUploadFailed = errors.New(
 		"something went wrong while uploading the file",
 	)
 
 	// ErrAvatarNotFound is returned when an avatar cannot be found.
 	ErrAvatarNotFound = errors.New("requested avatar not found")
-	// ErrAvatarQueryFailed is returned when avatar retrieval fails.
-	ErrAvatarQueryFailed = errors.New("failed to query avatar")
+	// errAvatarQueryFailed is returned when avatar retrieval fails.
+	errAvatarQueryFailed = errors.New("failed to query avatar")
 
 	// ErrAvatarDeletionForbidden is returned for deletion by a non-owner.
 	ErrAvatarDeletionForbidden = errors.New("you can only delete your own avatars")
-	// ErrAvatarDeletionFailed is returned when avatar deletion fails.
-	ErrAvatarDeletionFailed = errors.New("failed to delete avatar")
+	// errAvatarDeletionFailed is returned when avatar deletion fails.
+	errAvatarDeletionFailed = errors.New("failed to delete avatar")
 )
 
 var supportedMimeTypes = []string{
@@ -230,7 +230,7 @@ func (s *avatarsService) Create(
 	fileID, err := uuid.NewV7()
 	if err != nil {
 		s.logger.Error().Err(err).Msg("failed to create a new file ID")
-		return nil, ErrUploadFailed
+		return nil, errUploadFailed
 	}
 
 	fileKey := "avatars/" + fileID.String()
@@ -245,7 +245,7 @@ func (s *avatarsService) Create(
 	})
 	if err != nil {
 		s.logger.Error().Err(err).Msg("failed to create a new avatar")
-		return nil, ErrUploadFailed
+		return nil, errUploadFailed
 	}
 
 	logger := s.logger.With().Str("avatar_id", avatar.ID.String()).Logger()
@@ -256,7 +256,7 @@ func (s *avatarsService) Create(
 	)
 	if err != nil {
 		logger.Error().Err(err).Msg("failed to update upload status")
-		return nil, ErrUploadFailed
+		return nil, errUploadFailed
 	}
 
 	originalURL, err := s.storage.Store(ctx, storage.StoreInput{
@@ -271,11 +271,11 @@ func (s *avatarsService) Create(
 		_, statusErr := s.updateUploadStatus(ctx, avatar.ID, models.UploadStatusFailed)
 		if statusErr != nil {
 			logger.Error().Err(statusErr).Msg("failed to update upload status")
-			return nil, ErrUploadFailed
+			return nil, errUploadFailed
 		}
 
 		logger.Error().Err(storeErr).Msg("failed to upload avatar to S3")
-		return nil, ErrUploadFailed
+		return nil, errUploadFailed
 	}
 
 	avatar, err = s.updateUploadStatus(
@@ -285,7 +285,7 @@ func (s *avatarsService) Create(
 	)
 	if err != nil {
 		logger.Error().Err(err).Msg("failed to update upload status")
-		return nil, ErrUploadFailed
+		return nil, errUploadFailed
 	}
 
 	newProcessingStatus := models.ProcessingStatusProcessing
@@ -298,18 +298,17 @@ func (s *avatarsService) Create(
 	)
 	if err != nil {
 		logger.Error().Err(err).Msg("failed to update processing status")
-		return nil, ErrUploadFailed
+		return nil, errUploadFailed
 	}
 
-	err = s.queue.RequestResize(ctx, pkg.MessageResizeRequest{
+	if resizeErr := s.queue.RequestResize(ctx, pkg.MessageResizeRequest{
 		ID:       avatar.ID,
 		UserID:   avatar.UserID,
 		FileName: fileName,
 		Key:      fileKey,
-	})
-	if err != nil {
+	}); resizeErr != nil {
 		newProcessingStatus := models.ProcessingStatusFailed
-		avatar, err = s.avatarsRepository.Update(
+		_, err = s.avatarsRepository.Update(
 			ctx,
 			avatar.ID,
 			repositories.UpdateAvatarInput{
@@ -318,11 +317,11 @@ func (s *avatarsService) Create(
 		)
 		if err != nil {
 			logger.Error().Err(err).Msg("failed to update processing status")
-			return nil, ErrUploadFailed
+			return nil, errUploadFailed
 		}
 
-		logger.Error().Err(err).Msg("failed to queue file resize")
-		return nil, ErrUploadFailed
+		logger.Error().Err(resizeErr).Msg("failed to queue file resize")
+		return nil, errUploadFailed
 	}
 	logger.Info().Msg("queued file resize job")
 
@@ -353,7 +352,7 @@ func (s *avatarsService) GetByID(
 		s.logger.Error().Err(err).
 			Str("avatar_id", id.String()).
 			Msg("failed to retrieve avatar")
-		return "", nil, ErrAvatarQueryFailed
+		return "", nil, errAvatarQueryFailed
 	}
 
 	avatarBytes, err := s.storage.Retrieve(ctx, avatar.S3Key)
@@ -361,7 +360,7 @@ func (s *avatarsService) GetByID(
 		s.logger.Error().Err(err).
 			Str("avatar_id", id.String()).
 			Msg("failed to load avatar from the storage")
-		return "", nil, ErrAvatarQueryFailed
+		return "", nil, errAvatarQueryFailed
 	}
 
 	return avatar.MimeType, avatarBytes, nil
@@ -379,7 +378,7 @@ func (s *avatarsService) GetMetadataByID(
 		s.logger.Error().Err(err).
 			Str("avatar_id", id.String()).
 			Msg("failed to retrieve avatar")
-		return nil, ErrAvatarQueryFailed
+		return nil, errAvatarQueryFailed
 	}
 
 	result := GetMetadataResult{
@@ -407,7 +406,7 @@ func (s *avatarsService) GetByUserID(
 		s.logger.Error().Err(err).
 			Str("user_id", userID.String()).
 			Msg("failed to retrieve user avatars")
-		return "", nil, ErrAvatarQueryFailed
+		return "", nil, errAvatarQueryFailed
 	}
 	if len(avatars) == 0 {
 		return "", nil, ErrAvatarNotFound
@@ -419,7 +418,7 @@ func (s *avatarsService) GetByUserID(
 		s.logger.Error().Err(err).
 			Str("user_id", userID.String()).
 			Msg("failed to retrieve last avatar")
-		return "", nil, ErrAvatarQueryFailed
+		return "", nil, errAvatarQueryFailed
 	}
 
 	return avatar.MimeType, avatarBytes, nil
@@ -434,7 +433,7 @@ func (s *avatarsService) ListForUser(
 		s.logger.Error().Err(err).
 			Str("user_id", userID.String()).
 			Msg("failed to list user avatars")
-		return nil, ErrAvatarQueryFailed
+		return nil, errAvatarQueryFailed
 	}
 
 	results := make([]GetMetadataResult, 0, len(avatars))
@@ -471,7 +470,7 @@ func (s *avatarsService) DeleteByID(
 			Str("user_id", userID.String()).
 			Str("id", id.String()).
 			Msg("failed to retrieve avatar")
-		return ErrAvatarQueryFailed
+		return errAvatarQueryFailed
 	}
 
 	if avatar.UserID != userID {
@@ -483,7 +482,7 @@ func (s *avatarsService) DeleteByID(
 			Str("user_id", userID.String()).
 			Str("id", id.String()).
 			Msg("failed to delete avatar")
-		return ErrAvatarDeletionFailed
+		return errAvatarDeletionFailed
 	}
 
 	if err := s.queue.RequestDelete(ctx, pkg.MessageDeleteRequest{
@@ -494,7 +493,7 @@ func (s *avatarsService) DeleteByID(
 			Str("user_id", userID.String()).
 			Str("id", id.String()).
 			Msg("failed to queue avatar storage deletion")
-		return ErrAvatarDeletionFailed
+		return errAvatarDeletionFailed
 	}
 
 	return nil
@@ -514,7 +513,7 @@ func (s *avatarsService) DeleteLatestForUser(
 		s.logger.Error().Err(err).
 			Str("user_id", userID.String()).
 			Msg("failed to look up user avatars for deletion")
-		return ErrAvatarQueryFailed
+		return errAvatarQueryFailed
 	}
 	if len(avatars) == 0 {
 		return ErrAvatarNotFound
@@ -527,17 +526,13 @@ func (s *avatarsService) CompleteResize(
 	ctx context.Context,
 	message pkg.MessageResizeDone,
 ) error {
-	thumbnailKeys := models.ThumbnailS3Keys{
-		Size100x100: message.ThumbnailS3Keys.Size100x100,
-		Size300x300: message.ThumbnailS3Keys.Size300x300,
-	}
 	processingStatus := models.ProcessingStatusCompleted
 
 	_, err := s.avatarsRepository.Update(
 		ctx,
 		message.ID,
 		repositories.UpdateAvatarInput{
-			ThumbnailS3Keys:  &thumbnailKeys,
+			ThumbnailS3Keys:  &message.ThumbnailS3Keys,
 			ProcessingStatus: &processingStatus,
 		},
 	)
@@ -549,7 +544,7 @@ func (s *avatarsService) CompleteResize(
 		s.logger.Error().Err(err).
 			Str("avatar_id", message.ID.String()).
 			Msg("failed to complete avatar resize")
-		return ErrUploadFailed
+		return errUploadFailed
 	}
 
 	return nil

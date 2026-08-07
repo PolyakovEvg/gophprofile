@@ -15,6 +15,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/pelfox/gophprofile/internal/config"
+	"github.com/pelfox/gophprofile/internal/models"
 	"github.com/pelfox/gophprofile/internal/queue"
 	"github.com/pelfox/gophprofile/internal/storage"
 	"github.com/pelfox/gophprofile/pkg"
@@ -399,10 +400,10 @@ func (p *processor) processDelete(ctx context.Context, body []byte) error {
 func (p *processor) createThumbnails(
 	ctx context.Context,
 	message pkg.MessageResizeRequest,
-) (pkg.ThumbnailS3Keys, error) {
+) (models.ThumbnailS3Keys, error) {
 	original, err := p.storage.Retrieve(ctx, message.FileName)
 	if err != nil {
-		return pkg.ThumbnailS3Keys{}, fmt.Errorf(
+		return models.ThumbnailS3Keys{}, fmt.Errorf(
 			"failed to retrieve original avatar: %w",
 			err,
 		)
@@ -410,18 +411,18 @@ func (p *processor) createThumbnails(
 
 	source, _, err := image.Decode(bytes.NewReader(original))
 	if err != nil {
-		return pkg.ThumbnailS3Keys{}, fmt.Errorf(
+		return models.ThumbnailS3Keys{}, fmt.Errorf(
 			"failed to decode original avatar: %w",
 			err,
 		)
 	}
 
-	var keys pkg.ThumbnailS3Keys
+	var keys models.ThumbnailS3Keys
 	for _, thumbnail := range thumbnailSizes {
 		key := path.Join(message.Key, thumbnail.label+".jpg")
 		payload, err := resizeToJPEG(source, thumbnail.size)
 		if err != nil {
-			return pkg.ThumbnailS3Keys{}, err
+			return models.ThumbnailS3Keys{}, err
 		}
 
 		_, err = p.storage.Store(ctx, storage.StoreInput{
@@ -432,7 +433,7 @@ func (p *processor) createThumbnails(
 			AvatarID:    message.ID,
 		})
 		if err != nil {
-			return pkg.ThumbnailS3Keys{}, fmt.Errorf(
+			return models.ThumbnailS3Keys{}, fmt.Errorf(
 				"failed to store %s thumbnail: %w",
 				thumbnail.label,
 				err,

@@ -10,6 +10,7 @@ import (
 	"github.com/pelfox/gophprofile/internal/dto"
 	"github.com/pelfox/gophprofile/internal/services"
 	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 )
 
 const (
@@ -22,7 +23,9 @@ func WriteJSON(w http.ResponseWriter, code int, payload any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	if err := json.NewEncoder(w).Encode(payload); err != nil {
-		http.Error(w, "Failed to write the response.", http.StatusInternalServerError)
+		// The status code and part of the body may already be on the wire,
+		// so the response can no longer be changed at this point.
+		log.Error().Err(err).Msg("failed to write JSON response")
 	}
 }
 
@@ -62,7 +65,16 @@ func (c *AvatarsController) Upload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	r.Body = http.MaxBytesReader(w, r.Body, uploadFormSize)
 	if err := r.ParseMultipartForm(uploadFormSize); err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			WriteJSON(w, http.StatusRequestEntityTooLarge, dto.FileTooLargeResponse{
+				Error:   "File too large.",
+				MaxSize: uploadFormSize,
+			})
+			return
+		}
 		WriteError(w, http.StatusUnprocessableEntity, "Invalid request body.")
 		return
 	}
