@@ -6,23 +6,22 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/pelfox/gophprofile/internal/tracing"
 	"github.com/pelfox/gophprofile/pkg"
 	amqp "github.com/rabbitmq/amqp091-go"
-	"github.com/rs/zerolog"
+	"go.opentelemetry.io/otel"
+	semconv "go.opentelemetry.io/otel/semconv/v1.34.0"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type rabbitMQQueue struct {
-	logger  zerolog.Logger
 	channel *amqp.Channel
 	queues  map[string]amqp.Queue
 	mu      sync.Mutex
 }
 
 // NewRabbitMQQueue creates a RabbitMQ-backed queue provider.
-func NewRabbitMQQueue(
-	logger zerolog.Logger,
-	conn *amqp.Connection,
-) (PublisherProvider, error) {
+func NewRabbitMQQueue(conn *amqp.Connection) (PublisherProvider, error) {
 	channel, err := conn.Channel()
 	if err != nil {
 		return nil, fmt.Errorf("failed to open a new RabbitMQ channel: %w", err)
@@ -52,7 +51,6 @@ func NewRabbitMQQueue(
 	}
 
 	return &rabbitMQQueue{
-		logger:  logger.With().Str("queue", "rabbitmq").Logger(),
 		channel: channel,
 		queues:  queues,
 	}, nil
@@ -83,7 +81,19 @@ func (r *rabbitMQQueue) publish(
 	ctx context.Context,
 	queueName string,
 	message any,
-) error {
+) (err error) {
+	ctx, span := otel.Tracer(tracerName).Start(
+		ctx,
+		"queue.publish "+queueName,
+		trace.WithSpanKind(trace.SpanKindProducer),
+		trace.WithAttributes(
+			semconv.MessagingSystemRabbitMQ,
+			semconv.MessagingDestinationName(queueName),
+		),
+	)
+	defer span.End()
+	defer tracing.RecordSpanErr(span, &err)
+
 	body, err := json.Marshal(message)
 	if err != nil {
 		return fmt.Errorf("failed to marshal request message: %w", err)
@@ -96,21 +106,21 @@ func (r *rabbitMQQueue) publish(
 	publishing := amqp.Publishing{
 		ContentType:  "application/json",
 		DeliveryMode: amqp.Persistent,
+		Headers:      injectHeaders(ctx, amqp.Table{}),
 		Body:         body,
 	}
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	err = r.channel.PublishWithContext(
+	if err := r.channel.PublishWithContext(
 		ctx,
 		"",
 		queue.Name,
 		false,
 		false,
 		publishing,
-	)
-	if err != nil {
+	); err != nil {
 		return fmt.Errorf("failed to publish request message: %w", err)
 	}
 

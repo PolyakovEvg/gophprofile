@@ -12,11 +12,13 @@ import (
 	"slices"
 	"testing"
 
+	"log/slog"
+
 	"github.com/google/uuid"
 	"github.com/pelfox/gophprofile/internal/models"
 	"github.com/pelfox/gophprofile/internal/storage"
 	"github.com/pelfox/gophprofile/pkg"
-	"github.com/rs/zerolog"
+	amqp "github.com/rabbitmq/amqp091-go"
 )
 
 type fakeStorage struct {
@@ -124,7 +126,7 @@ func TestProcessorProcessResizeCreatesThumbnailsAndPublishesCompletion(
 	queueProvider := &fakeQueue{}
 	processor := newTestProcessor(queueProvider, storageProvider)
 
-	if err := processor.processResize(ctx, jsonPayload(t, request)); err != nil {
+	if err := processor.processResize(ctx, amqp.Delivery{Body: jsonPayload(t, request)}); err != nil {
 		t.Fatalf("processResize returned error: %v", err)
 	}
 
@@ -234,7 +236,7 @@ func TestProcessorProcessResizeRejectsInvalidMessages(t *testing.T) {
 			queueProvider := &fakeQueue{}
 			processor := newTestProcessor(queueProvider, storageProvider)
 
-			err := processor.processResize(context.Background(), tt.body)
+			err := processor.processResize(context.Background(), amqp.Delivery{Body: tt.body})
 			if err == nil {
 				t.Fatal("expected processResize to return error")
 			}
@@ -276,7 +278,7 @@ func TestProcessorProcessResizeReturnsStoreErrorWithoutPublishingCompletion(
 	queueProvider := &fakeQueue{}
 	processor := newTestProcessor(queueProvider, storageProvider)
 
-	err := processor.processResize(ctx, jsonPayload(t, request))
+	err := processor.processResize(ctx, amqp.Delivery{Body: jsonPayload(t, request)})
 	if !errors.Is(err, storeErr) {
 		t.Fatalf("expected store error, got %v", err)
 	}
@@ -307,7 +309,7 @@ func TestProcessorProcessResizeReturnsCompletionPublishError(t *testing.T) {
 	queueProvider := &fakeQueue{resizeDoneErr: publishErr}
 	processor := newTestProcessor(queueProvider, storageProvider)
 
-	err := processor.processResize(ctx, jsonPayload(t, request))
+	err := processor.processResize(ctx, amqp.Delivery{Body: jsonPayload(t, request)})
 	if !errors.Is(err, publishErr) {
 		t.Fatalf("expected publish error, got %v", err)
 	}
@@ -338,7 +340,7 @@ func TestProcessorProcessDeleteDeletesStorageKeys(t *testing.T) {
 
 	if err := processor.processDelete(
 		context.Background(),
-		jsonPayload(t, request),
+		amqp.Delivery{Body: jsonPayload(t, request)},
 	); err != nil {
 		t.Fatalf("processDelete returned error: %v", err)
 	}
@@ -370,7 +372,7 @@ func TestProcessorProcessDeleteRejectsInvalidMessages(t *testing.T) {
 			queueProvider := &fakeQueue{}
 			processor := newTestProcessor(queueProvider, storageProvider)
 
-			err := processor.processDelete(context.Background(), tt.body)
+			err := processor.processDelete(context.Background(), amqp.Delivery{Body: tt.body})
 			if err == nil {
 				t.Fatal("expected processDelete to return error")
 			}
@@ -393,7 +395,7 @@ func TestProcessorProcessDeleteReturnsStorageError(t *testing.T) {
 		Keys: []string{"avatars/source/original.png"},
 	}
 
-	err := processor.processDelete(context.Background(), jsonPayload(t, request))
+	err := processor.processDelete(context.Background(), amqp.Delivery{Body: jsonPayload(t, request)})
 	if !errors.Is(err, deleteErr) {
 		t.Fatalf("expected delete error, got %v", err)
 	}
@@ -437,7 +439,7 @@ func TestCenterSquare(t *testing.T) {
 
 func newTestProcessor(queueProvider *fakeQueue, storageProvider *fakeStorage) *processor {
 	return &processor{
-		logger:  zerolog.Nop(),
+		logger:  slog.New(slog.DiscardHandler),
 		queue:   queueProvider,
 		storage: storageProvider,
 	}

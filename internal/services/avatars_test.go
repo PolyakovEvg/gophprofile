@@ -15,11 +15,13 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/pelfox/gophprofile/internal/metrics"
 	"github.com/pelfox/gophprofile/internal/models"
 	"github.com/pelfox/gophprofile/internal/repositories"
 	"github.com/pelfox/gophprofile/internal/storage"
 	"github.com/pelfox/gophprofile/pkg"
-	"github.com/rs/zerolog"
+	"github.com/prometheus/client_golang/prometheus/testutil"
+	"log/slog"
 )
 
 type testFile struct {
@@ -81,7 +83,7 @@ func (r *fakeAvatarsRepository) GetForUser(
 	if r.getErr != nil {
 		return nil, r.getErr
 	}
-	if r.record == nil || r.record.UserID != userID {
+	if r.record == nil || r.record.UserID != userID || r.record.DeletedAt != nil {
 		return []models.Avatar{}, nil
 	}
 
@@ -238,7 +240,7 @@ func TestAvatarsServiceCreateQueuesResizeJob(t *testing.T) {
 	queueProvider := &fakeQueue{}
 
 	service := NewAvatarsService(
-		zerolog.Nop(),
+		slog.New(slog.DiscardHandler),
 		repository,
 		storageProvider,
 		queueProvider,
@@ -325,7 +327,7 @@ func TestAvatarsServiceCreateMarksProcessingFailedWhenResizeQueueFails(t *testin
 	repository := &fakeAvatarsRepository{avatar: avatarID}
 	queueProvider := &fakeQueue{resizeErr: errors.New("queue unavailable")}
 	service := NewAvatarsService(
-		zerolog.Nop(),
+		slog.New(slog.DiscardHandler),
 		repository,
 		&fakeStorage{},
 		queueProvider,
@@ -350,7 +352,7 @@ func TestAvatarsServiceCreateRejectsUnsupportedFileWithoutSideEffects(t *testing
 	storageProvider := &fakeStorage{}
 	queueProvider := &fakeQueue{}
 	service := NewAvatarsService(
-		zerolog.Nop(),
+		slog.New(slog.DiscardHandler),
 		repository,
 		storageProvider,
 		queueProvider,
@@ -393,7 +395,7 @@ func TestAvatarsServiceDeleteByIDQueuesStorageDeletion(t *testing.T) {
 	}
 	queueProvider := &fakeQueue{}
 	service := NewAvatarsService(
-		zerolog.Nop(),
+		slog.New(slog.DiscardHandler),
 		repository,
 		&fakeStorage{},
 		queueProvider,
@@ -423,6 +425,44 @@ func TestAvatarsServiceDeleteByIDQueuesStorageDeletion(t *testing.T) {
 	}
 }
 
+func TestAvatarsServiceDeleteByIDClearsStorageBytesMetricForLastAvatar(t *testing.T) {
+	ctx := context.Background()
+	userID := uuid.MustParse("11111111-1111-1111-1111-111111111111")
+	avatarID := uuid.MustParse("22222222-2222-2222-2222-222222222222")
+
+	repository := &fakeAvatarsRepository{
+		record: &models.Avatar{
+			ID:        avatarID,
+			UserID:    userID,
+			S3Key:     "avatars/source/original.png",
+			SizeBytes: 42,
+		},
+	}
+	service := NewAvatarsService(
+		slog.New(slog.DiscardHandler),
+		repository,
+		&fakeStorage{},
+		&fakeQueue{},
+	)
+
+	metrics.AvatarsStorageBytes.WithLabelValues(userID.String()).Set(42)
+	if got := testutil.ToFloat64(
+		metrics.AvatarsStorageBytes.WithLabelValues(userID.String()),
+	); got != 42 {
+		t.Fatalf("expected metric to be seeded at 42, got %v", got)
+	}
+
+	if err := service.DeleteByID(ctx, avatarID, userID); err != nil {
+		t.Fatalf("DeleteByID returned error: %v", err)
+	}
+
+	if got := testutil.ToFloat64(
+		metrics.AvatarsStorageBytes.WithLabelValues(userID.String()),
+	); got != 0 {
+		t.Fatalf("expected storage bytes metric to be cleared, got %v", got)
+	}
+}
+
 func TestAvatarsServiceDeleteByIDPredictsMissingThumbnailKeys(t *testing.T) {
 	ctx := context.Background()
 	userID := uuid.MustParse("11111111-1111-1111-1111-111111111111")
@@ -437,7 +477,7 @@ func TestAvatarsServiceDeleteByIDPredictsMissingThumbnailKeys(t *testing.T) {
 	}
 	queueProvider := &fakeQueue{}
 	service := NewAvatarsService(
-		zerolog.Nop(),
+		slog.New(slog.DiscardHandler),
 		repository,
 		&fakeStorage{},
 		queueProvider,
@@ -476,7 +516,7 @@ func TestAvatarsServiceDeleteByIDRejectsWrongOwner(t *testing.T) {
 	}
 	queueProvider := &fakeQueue{}
 	service := NewAvatarsService(
-		zerolog.Nop(),
+		slog.New(slog.DiscardHandler),
 		repository,
 		&fakeStorage{},
 		queueProvider,
@@ -509,7 +549,7 @@ func TestAvatarsServiceListForUserReturnsMetadata(t *testing.T) {
 		},
 	}
 	service := NewAvatarsService(
-		zerolog.Nop(),
+		slog.New(slog.DiscardHandler),
 		repository,
 		&fakeStorage{},
 		&fakeQueue{},
@@ -530,7 +570,7 @@ func TestAvatarsServiceListForUserReturnsMetadata(t *testing.T) {
 func TestAvatarsServiceListForUserReturnsEmptyForUnknownUser(t *testing.T) {
 	ctx := context.Background()
 	service := NewAvatarsService(
-		zerolog.Nop(),
+		slog.New(slog.DiscardHandler),
 		&fakeAvatarsRepository{},
 		&fakeStorage{},
 		&fakeQueue{},
@@ -559,7 +599,7 @@ func TestAvatarsServiceDeleteLatestForUserQueuesStorageDeletion(t *testing.T) {
 	}
 	queueProvider := &fakeQueue{}
 	service := NewAvatarsService(
-		zerolog.Nop(),
+		slog.New(slog.DiscardHandler),
 		repository,
 		&fakeStorage{},
 		queueProvider,
@@ -583,7 +623,7 @@ func TestAvatarsServiceDeleteLatestForUserRejectsWrongRequester(t *testing.T) {
 
 	repository := &fakeAvatarsRepository{}
 	service := NewAvatarsService(
-		zerolog.Nop(),
+		slog.New(slog.DiscardHandler),
 		repository,
 		&fakeStorage{},
 		&fakeQueue{},
@@ -603,7 +643,7 @@ func TestAvatarsServiceDeleteLatestForUserRequiresExistingAvatar(t *testing.T) {
 	userID := uuid.New()
 
 	service := NewAvatarsService(
-		zerolog.Nop(),
+		slog.New(slog.DiscardHandler),
 		&fakeAvatarsRepository{},
 		&fakeStorage{},
 		&fakeQueue{},
@@ -623,7 +663,7 @@ func TestAvatarsServiceCompleteResizeUpdatesRepository(t *testing.T) {
 		record: &models.Avatar{ID: avatarID},
 	}
 	service := NewAvatarsService(
-		zerolog.Nop(),
+		slog.New(slog.DiscardHandler),
 		repository,
 		&fakeStorage{},
 		&fakeQueue{},
@@ -661,7 +701,7 @@ func TestAvatarsServiceCompleteResizeUpdatesRepository(t *testing.T) {
 
 func TestAvatarsServiceCompleteResizeMapsMissingAvatar(t *testing.T) {
 	service := NewAvatarsService(
-		zerolog.Nop(),
+		slog.New(slog.DiscardHandler),
 		&fakeAvatarsRepository{updateErr: repositories.ErrAvatarNotFound},
 		&fakeStorage{},
 		&fakeQueue{},

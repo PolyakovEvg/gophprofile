@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/exaring/otelpgx"
 	"github.com/go-chi/chi/v5"
 	"github.com/golang-migrate/migrate/v4"
 	migratepgx "github.com/golang-migrate/migrate/v4/database/pgx/v5"
@@ -22,21 +24,26 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/pelfox/gophprofile/internal/config"
 	"github.com/pelfox/gophprofile/internal/controllers"
+	"github.com/pelfox/gophprofile/internal/logging"
+	"github.com/pelfox/gophprofile/internal/metrics"
 	"github.com/pelfox/gophprofile/internal/queue"
 	"github.com/pelfox/gophprofile/internal/repositories"
 	"github.com/pelfox/gophprofile/internal/services"
 	"github.com/pelfox/gophprofile/internal/storage"
+	"github.com/pelfox/gophprofile/internal/telemetry"
+	"github.com/pelfox/gophprofile/internal/tracing"
 	"github.com/pelfox/gophprofile/migrations"
 	"github.com/pelfox/gophprofile/pkg"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	amqp "github.com/rabbitmq/amqp091-go"
-	"github.com/rs/zerolog"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"golang.org/x/sync/errgroup"
 )
 
 const shutdownTimeout = 10 * time.Second
 
 // Run starts the application with the given logger and configuration.
-func Run(logger zerolog.Logger, cfg *config.AppConfig) error {
+func Run(logger *slog.Logger, cfg *config.AppConfig) error {
 	ctx, stop := signal.NotifyContext(
 		context.Background(),
 		os.Interrupt,
@@ -44,7 +51,13 @@ func Run(logger zerolog.Logger, cfg *config.AppConfig) error {
 	)
 	defer stop()
 
-	pool, err := pgxpool.New(ctx, cfg.DatabaseURL)
+	poolConfig, err := pgxpool.ParseConfig(cfg.DatabaseURL)
+	if err != nil {
+		return fmt.Errorf("failed to parse database URL: %w", err)
+	}
+	poolConfig.ConnConfig.Tracer = otelpgx.NewTracer()
+
+	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
 	if err != nil {
 		return fmt.Errorf("failed to create database pool: %w", err)
 	}
@@ -64,7 +77,7 @@ func Run(logger zerolog.Logger, cfg *config.AppConfig) error {
 	}
 	defer conn.Close()
 
-	queueProvider, err := queue.NewRabbitMQQueue(logger, conn)
+	queueProvider, err := queue.NewRabbitMQQueue(conn)
 	if err != nil {
 		return err
 	}
@@ -108,17 +121,31 @@ func Run(logger zerolog.Logger, cfg *config.AppConfig) error {
 		}),
 	)
 
+	handler := otelhttp.NewHandler(
+		newRouter(avatarsController, healthController),
+		"http-server",
+	)
 	server := &http.Server{
 		Addr:    cfg.ListenAddr,
-		Handler: newRouter(avatarsController, healthController),
+		Handler: handler,
 	}
+
+	if err := metrics.WatchQueueDepths(ctx, logger, conn, []string{
+		queue.ResizeQueueName,
+		queue.ResizeDoneQueueName,
+		queue.DeleteQueueName,
+	}); err != nil {
+		return fmt.Errorf("failed to start queue depth watcher: %w", err)
+	}
+	go metrics.WatchDBPool(ctx, pool)
 
 	group, groupCtx := errgroup.WithContext(ctx)
 	group.Go(func() error {
 		return consumeResizeDoneQueue(groupCtx, logger, conn, avatarsService)
 	})
 	group.Go(func() error {
-		logger.Info().Str("addr", cfg.ListenAddr).Msg("started HTTP server")
+		logging.FromContext(ctx, logger).
+			Info("started HTTP server", "addr", cfg.ListenAddr)
 		if err := server.ListenAndServe(); err != nil &&
 			!errors.Is(err, http.ErrServerClosed) {
 			return fmt.Errorf("failed to run HTTP server: %w", err)
@@ -139,10 +166,13 @@ func newRouter(
 	healthController *controllers.HealthController,
 ) http.Handler {
 	router := chi.NewRouter()
+	router.Use(metrics.HTTPMiddleware)
+	router.Use(telemetry.RouteTag)
 	router.Get("/", func(w http.ResponseWriter, r *http.Request) {
 		http.ServeFile(w, r, "web/index.html")
 	})
 	router.Get("/health", healthController.Health)
+	router.Handle("/metrics", promhttp.Handler())
 	router.Route("/api/v1", func(router chi.Router) {
 		router.Post("/avatars", avatarsController.Upload)
 		router.Get("/avatars/{avatarID}", avatarsController.GetByID)
@@ -158,7 +188,7 @@ func newRouter(
 
 func consumeResizeDoneQueue(
 	ctx context.Context,
-	logger zerolog.Logger,
+	logger *slog.Logger,
 	conn *amqp.Connection,
 	avatarsService services.AvatarsService,
 ) error {
@@ -197,7 +227,7 @@ func consumeResizeDoneQueue(
 		return fmt.Errorf("failed to consume resize done queue: %w", err)
 	}
 
-	logger.Info().Msg("started resize completion consumer")
+	logger.Info("started resize completion consumer")
 	for {
 		select {
 		case <-ctx.Done():
@@ -207,29 +237,51 @@ func consumeResizeDoneQueue(
 				return errors.New("resize completion consumer closed")
 			}
 
-			var message pkg.MessageResizeDone
-			if err := json.Unmarshal(delivery.Body, &message); err != nil {
-				logger.Error().Err(err).Msg("failed to unmarshal resize done message")
-				if err := delivery.Nack(false, false); err != nil {
-					return fmt.Errorf("failed to reject resize done message: %w", err)
-				}
-				continue
-			}
-
-			if err := avatarsService.CompleteResize(ctx, message); err != nil {
-				logger.Error().Err(err).Msg("failed to complete avatar resize")
-				requeue := !errors.Is(err, services.ErrAvatarNotFound)
-				if err := delivery.Nack(false, requeue); err != nil {
-					return fmt.Errorf("failed to reject resize done message: %w", err)
-				}
-				continue
-			}
-
-			if err := delivery.Ack(false); err != nil {
-				return fmt.Errorf("failed to acknowledge resize done message: %w", err)
+			if err := handleResizeDoneDelivery(
+				ctx, logger, delivery, avatarsService,
+			); err != nil {
+				return err
 			}
 		}
 	}
+}
+
+func handleResizeDoneDelivery(
+	ctx context.Context,
+	logger *slog.Logger,
+	delivery amqp.Delivery,
+	avatarsService services.AvatarsService,
+) error {
+	spanCtx, span := queue.StartConsumerSpan(
+		ctx, delivery.Headers, queue.ResizeDoneQueueName,
+	)
+	defer span.End()
+	requestLogger := logging.FromContext(spanCtx, logger)
+
+	var message pkg.MessageResizeDone
+	if err := json.Unmarshal(delivery.Body, &message); err != nil {
+		tracing.RecordError(span, err)
+		requestLogger.Error("failed to unmarshal resize done message", "error", err)
+		if err := delivery.Nack(false, false); err != nil {
+			return fmt.Errorf("failed to reject resize done message: %w", err)
+		}
+		return nil
+	}
+
+	if err := avatarsService.CompleteResize(spanCtx, message); err != nil {
+		tracing.RecordError(span, err)
+		requestLogger.Error("failed to complete avatar resize", "error", err)
+		requeue := !errors.Is(err, services.ErrAvatarNotFound)
+		if err := delivery.Nack(false, requeue); err != nil {
+			return fmt.Errorf("failed to reject resize done message: %w", err)
+		}
+		return nil
+	}
+
+	if err := delivery.Ack(false); err != nil {
+		return fmt.Errorf("failed to acknowledge resize done message: %w", err)
+	}
+	return nil
 }
 
 func runMigrations(databaseURL string) error {

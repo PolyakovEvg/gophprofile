@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"mime/multipart"
 	"net/http"
 	"path"
@@ -12,13 +13,19 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/pelfox/gophprofile/internal/logging"
+	"github.com/pelfox/gophprofile/internal/metrics"
 	"github.com/pelfox/gophprofile/internal/models"
 	"github.com/pelfox/gophprofile/internal/queue"
 	"github.com/pelfox/gophprofile/internal/repositories"
 	"github.com/pelfox/gophprofile/internal/storage"
+	"github.com/pelfox/gophprofile/internal/tracing"
 	"github.com/pelfox/gophprofile/pkg"
-	"github.com/rs/zerolog"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 )
+
+const tracerName = "avatar-service"
 
 const maxFileSize = 10485760 // 10 MiB
 
@@ -168,7 +175,7 @@ type AvatarsService interface {
 }
 
 type avatarsService struct {
-	logger            zerolog.Logger
+	logger            *slog.Logger
 	avatarsRepository repositories.AvatarsRepository
 	storage           storage.Provider
 	queue             queue.PublisherProvider
@@ -176,13 +183,13 @@ type avatarsService struct {
 
 // NewAvatarsService creates an avatar service.
 func NewAvatarsService(
-	logger zerolog.Logger,
+	logger *slog.Logger,
 	avatarsRepository repositories.AvatarsRepository,
 	storage storage.Provider,
 	queue queue.PublisherProvider,
 ) AvatarsService {
 	return &avatarsService{
-		logger:            logger.With().Str("service", "avatars").Logger(),
+		logger:            logger.With("component", "avatars"),
 		avatarsRepository: avatarsRepository,
 		storage:           storage,
 		queue:             queue,
@@ -211,14 +218,37 @@ func (s *avatarsService) Create(
 	ctx context.Context,
 	userID uuid.UUID,
 	input CreateAvatarInput,
-) (*CreateAvatarResult, error) {
+) (result *CreateAvatarResult, err error) {
+	ctx, span := otel.Tracer(tracerName).Start(ctx, "upload_avatar")
+	defer span.End()
+
+	span.SetAttributes(
+		attribute.String("user_id", userID.String()),
+		attribute.String("file_name", input.Header.Filename),
+		attribute.Int64("file_size", input.Header.Size),
+	)
+
+	start := time.Now()
+	defer func() {
+		status := "success"
+		if err != nil {
+			status = "error"
+			tracing.RecordSpanErr(span, &err)
+		}
+		metrics.AvatarsUploadsTotal.WithLabelValues(status).Inc()
+		metrics.AvatarsUploadDuration.WithLabelValues(status).
+			Observe(time.Since(start).Seconds())
+	}()
+
+	logger := logging.FromContext(ctx, s.logger)
+
 	if input.Header.Size > maxFileSize {
 		return nil, ErrFileTooLarge
 	}
 
 	bytes, err := io.ReadAll(input.File)
 	if err != nil {
-		s.logger.Error().Err(err).Msg("failed to read the file")
+		logger.Error("failed to read the file", "error", err)
 		return nil, ErrInvalidFile
 	}
 
@@ -229,7 +259,7 @@ func (s *avatarsService) Create(
 
 	fileID, err := uuid.NewV7()
 	if err != nil {
-		s.logger.Error().Err(err).Msg("failed to create a new file ID")
+		logger.Error("failed to create a new file ID", "error", err)
 		return nil, errUploadFailed
 	}
 
@@ -244,18 +274,18 @@ func (s *avatarsService) Create(
 		S3Key:     fileName,
 	})
 	if err != nil {
-		s.logger.Error().Err(err).Msg("failed to create a new avatar")
+		logger.Error("failed to create a new avatar", "error", err)
 		return nil, errUploadFailed
 	}
 
-	logger := s.logger.With().Str("avatar_id", avatar.ID.String()).Logger()
+	logger = logger.With("avatar_id", avatar.ID.String())
 	avatar, err = s.updateUploadStatus(
 		ctx,
 		avatar.ID,
 		models.UploadStatusUploading,
 	)
 	if err != nil {
-		logger.Error().Err(err).Msg("failed to update upload status")
+		logger.Error("failed to update upload status", "error", err)
 		return nil, errUploadFailed
 	}
 
@@ -270,11 +300,11 @@ func (s *avatarsService) Create(
 		storeErr := err
 		_, statusErr := s.updateUploadStatus(ctx, avatar.ID, models.UploadStatusFailed)
 		if statusErr != nil {
-			logger.Error().Err(statusErr).Msg("failed to update upload status")
+			logger.Error("failed to update upload status", "error", statusErr)
 			return nil, errUploadFailed
 		}
 
-		logger.Error().Err(storeErr).Msg("failed to upload avatar to S3")
+		logger.Error("failed to upload avatar to S3", "error", storeErr)
 		return nil, errUploadFailed
 	}
 
@@ -284,9 +314,11 @@ func (s *avatarsService) Create(
 		models.UploadStatusCompleted,
 	)
 	if err != nil {
-		logger.Error().Err(err).Msg("failed to update upload status")
+		logger.Error("failed to update upload status", "error", err)
 		return nil, errUploadFailed
 	}
+	metrics.AvatarsStorageBytes.WithLabelValues(userID.String()).
+		Set(float64(avatar.SizeBytes))
 
 	newProcessingStatus := models.ProcessingStatusProcessing
 	avatar, err = s.avatarsRepository.Update(
@@ -297,7 +329,7 @@ func (s *avatarsService) Create(
 		},
 	)
 	if err != nil {
-		logger.Error().Err(err).Msg("failed to update processing status")
+		logger.Error("failed to update processing status", "error", err)
 		return nil, errUploadFailed
 	}
 
@@ -316,14 +348,14 @@ func (s *avatarsService) Create(
 			},
 		)
 		if err != nil {
-			logger.Error().Err(err).Msg("failed to update processing status")
+			logger.Error("failed to update processing status", "error", err)
 			return nil, errUploadFailed
 		}
 
-		logger.Error().Err(resizeErr).Msg("failed to queue file resize")
+		logger.Error("failed to queue file resize", "error", resizeErr)
 		return nil, errUploadFailed
 	}
-	logger.Info().Msg("queued file resize job")
+	logger.Info("queued file resize job")
 
 	response := CreateAvatarResult{
 		ID:               avatar.ID,
@@ -343,23 +375,28 @@ func (s *avatarsService) Create(
 func (s *avatarsService) GetByID(
 	ctx context.Context,
 	id uuid.UUID,
-) (string, []byte, error) {
+) (_ string, _ []byte, err error) {
+	ctx, span := otel.Tracer(tracerName).Start(ctx, "get_avatar")
+	defer span.End()
+	span.SetAttributes(attribute.String("avatar_id", id.String()))
+	defer tracing.RecordSpanErr(span, &err)
+
+	logger := logging.FromContext(ctx, s.logger)
+
 	avatar, err := s.avatarsRepository.GetByID(ctx, id)
 	if err != nil {
 		if errors.Is(err, repositories.ErrAvatarNotFound) {
 			return "", nil, ErrAvatarNotFound
 		}
-		s.logger.Error().Err(err).
-			Str("avatar_id", id.String()).
-			Msg("failed to retrieve avatar")
+		logger.Error("failed to retrieve avatar",
+			"error", err, "avatar_id", id.String())
 		return "", nil, errAvatarQueryFailed
 	}
 
 	avatarBytes, err := s.storage.Retrieve(ctx, avatar.S3Key)
 	if err != nil {
-		s.logger.Error().Err(err).
-			Str("avatar_id", id.String()).
-			Msg("failed to load avatar from the storage")
+		logger.Error("failed to load avatar from the storage",
+			"error", err, "avatar_id", id.String())
 		return "", nil, errAvatarQueryFailed
 	}
 
@@ -369,15 +406,19 @@ func (s *avatarsService) GetByID(
 func (s *avatarsService) GetMetadataByID(
 	ctx context.Context,
 	id uuid.UUID,
-) (*GetMetadataResult, error) {
+) (_ *GetMetadataResult, err error) {
+	ctx, span := otel.Tracer(tracerName).Start(ctx, "get_avatar_metadata")
+	defer span.End()
+	span.SetAttributes(attribute.String("avatar_id", id.String()))
+	defer tracing.RecordSpanErr(span, &err)
+
 	avatar, err := s.avatarsRepository.GetByID(ctx, id)
 	if err != nil {
 		if errors.Is(err, repositories.ErrAvatarNotFound) {
 			return nil, ErrAvatarNotFound
 		}
-		s.logger.Error().Err(err).
-			Str("avatar_id", id.String()).
-			Msg("failed to retrieve avatar")
+		logging.FromContext(ctx, s.logger).Error("failed to retrieve avatar",
+			"error", err, "avatar_id", id.String())
 		return nil, errAvatarQueryFailed
 	}
 
@@ -400,12 +441,18 @@ func (s *avatarsService) GetMetadataByID(
 func (s *avatarsService) GetByUserID(
 	ctx context.Context,
 	userID uuid.UUID,
-) (string, []byte, error) {
+) (_ string, _ []byte, err error) {
+	ctx, span := otel.Tracer(tracerName).Start(ctx, "get_user_avatar")
+	defer span.End()
+	span.SetAttributes(attribute.String("user_id", userID.String()))
+	defer tracing.RecordSpanErr(span, &err)
+
+	logger := logging.FromContext(ctx, s.logger)
+
 	avatars, err := s.avatarsRepository.GetForUser(ctx, userID)
 	if err != nil {
-		s.logger.Error().Err(err).
-			Str("user_id", userID.String()).
-			Msg("failed to retrieve user avatars")
+		logger.Error("failed to retrieve user avatars",
+			"error", err, "user_id", userID.String())
 		return "", nil, errAvatarQueryFailed
 	}
 	if len(avatars) == 0 {
@@ -415,9 +462,8 @@ func (s *avatarsService) GetByUserID(
 	avatar := avatars[0]
 	avatarBytes, err := s.storage.Retrieve(ctx, avatar.S3Key)
 	if err != nil {
-		s.logger.Error().Err(err).
-			Str("user_id", userID.String()).
-			Msg("failed to retrieve last avatar")
+		logger.Error("failed to retrieve last avatar",
+			"error", err, "user_id", userID.String())
 		return "", nil, errAvatarQueryFailed
 	}
 
@@ -427,12 +473,16 @@ func (s *avatarsService) GetByUserID(
 func (s *avatarsService) ListForUser(
 	ctx context.Context,
 	userID uuid.UUID,
-) ([]GetMetadataResult, error) {
+) (_ []GetMetadataResult, err error) {
+	ctx, span := otel.Tracer(tracerName).Start(ctx, "list_user_avatars")
+	defer span.End()
+	span.SetAttributes(attribute.String("user_id", userID.String()))
+	defer tracing.RecordSpanErr(span, &err)
+
 	avatars, err := s.avatarsRepository.GetForUser(ctx, userID)
 	if err != nil {
-		s.logger.Error().Err(err).
-			Str("user_id", userID.String()).
-			Msg("failed to list user avatars")
+		logging.FromContext(ctx, s.logger).Error("failed to list user avatars",
+			"error", err, "user_id", userID.String())
 		return nil, errAvatarQueryFailed
 	}
 
@@ -460,16 +510,32 @@ func (s *avatarsService) DeleteByID(
 	ctx context.Context,
 	id uuid.UUID,
 	userID uuid.UUID,
-) error {
+) (err error) {
+	ctx, span := otel.Tracer(tracerName).Start(ctx, "delete_avatar")
+	defer span.End()
+	span.SetAttributes(
+		attribute.String("user_id", userID.String()),
+		attribute.String("avatar_id", id.String()),
+	)
+
+	defer func() {
+		status := "success"
+		if err != nil {
+			status = "error"
+			tracing.RecordSpanErr(span, &err)
+		}
+		metrics.AvatarsDeletionsTotal.WithLabelValues(status).Inc()
+	}()
+
+	logger := logging.FromContext(ctx, s.logger)
+
 	avatar, err := s.avatarsRepository.GetByID(ctx, id)
 	if err != nil {
 		if errors.Is(err, repositories.ErrAvatarNotFound) {
 			return ErrAvatarNotFound
 		}
-		s.logger.Error().Err(err).
-			Str("user_id", userID.String()).
-			Str("id", id.String()).
-			Msg("failed to retrieve avatar")
+		logger.Error("failed to retrieve avatar",
+			"error", err, "user_id", userID.String(), "id", id.String())
 		return errAvatarQueryFailed
 	}
 
@@ -478,10 +544,8 @@ func (s *avatarsService) DeleteByID(
 	}
 
 	if err := s.avatarsRepository.Delete(ctx, id); err != nil {
-		s.logger.Error().Err(err).
-			Str("user_id", userID.String()).
-			Str("id", id.String()).
-			Msg("failed to delete avatar")
+		logger.Error("failed to delete avatar",
+			"error", err, "user_id", userID.String(), "id", id.String())
 		return errAvatarDeletionFailed
 	}
 
@@ -489,14 +553,40 @@ func (s *avatarsService) DeleteByID(
 		ID:   id,
 		Keys: getAvatarStorageKeys(avatar),
 	}); err != nil {
-		s.logger.Error().Err(err).
-			Str("user_id", userID.String()).
-			Str("id", id.String()).
-			Msg("failed to queue avatar storage deletion")
+		logger.Error("failed to queue avatar storage deletion",
+			"error", err, "user_id", userID.String(), "id", id.String())
 		return errAvatarDeletionFailed
 	}
 
+	s.refreshStorageBytesMetric(ctx, logger, userID)
+
 	return nil
+}
+
+// refreshStorageBytesMetric keeps the per-user avatars_storage_bytes gauge
+// from leaking a stale value once an avatar is deleted: it either points
+// the gauge at the user's remaining most recent avatar, or drops the
+// label entirely once the user has none left. Best-effort: a failure here
+// must not fail the deletion that already succeeded.
+func (s *avatarsService) refreshStorageBytesMetric(
+	ctx context.Context,
+	logger *slog.Logger,
+	userID uuid.UUID,
+) {
+	remaining, err := s.avatarsRepository.GetForUser(ctx, userID)
+	if err != nil {
+		logger.Error("failed to refresh storage bytes metric after deletion",
+			"error", err, "user_id", userID.String())
+		return
+	}
+
+	if len(remaining) == 0 {
+		metrics.AvatarsStorageBytes.DeleteLabelValues(userID.String())
+		return
+	}
+
+	metrics.AvatarsStorageBytes.WithLabelValues(userID.String()).
+		Set(float64(remaining[0].SizeBytes))
 }
 
 func (s *avatarsService) DeleteLatestForUser(
@@ -510,9 +600,10 @@ func (s *avatarsService) DeleteLatestForUser(
 
 	avatars, err := s.avatarsRepository.GetForUser(ctx, userID)
 	if err != nil {
-		s.logger.Error().Err(err).
-			Str("user_id", userID.String()).
-			Msg("failed to look up user avatars for deletion")
+		logging.FromContext(ctx, s.logger).Error(
+			"failed to look up user avatars for deletion",
+			"error", err, "user_id", userID.String(),
+		)
 		return errAvatarQueryFailed
 	}
 	if len(avatars) == 0 {
@@ -525,10 +616,15 @@ func (s *avatarsService) DeleteLatestForUser(
 func (s *avatarsService) CompleteResize(
 	ctx context.Context,
 	message pkg.MessageResizeDone,
-) error {
+) (err error) {
+	ctx, span := otel.Tracer(tracerName).Start(ctx, "complete_avatar_resize")
+	defer span.End()
+	span.SetAttributes(attribute.String("avatar_id", message.ID.String()))
+	defer tracing.RecordSpanErr(span, &err)
+
 	processingStatus := models.ProcessingStatusCompleted
 
-	_, err := s.avatarsRepository.Update(
+	_, err = s.avatarsRepository.Update(
 		ctx,
 		message.ID,
 		repositories.UpdateAvatarInput{
@@ -541,9 +637,10 @@ func (s *avatarsService) CompleteResize(
 			return ErrAvatarNotFound
 		}
 
-		s.logger.Error().Err(err).
-			Str("avatar_id", message.ID.String()).
-			Msg("failed to complete avatar resize")
+		logging.FromContext(ctx, s.logger).Error(
+			"failed to complete avatar resize",
+			"error", err, "avatar_id", message.ID.String(),
+		)
 		return errUploadFailed
 	}
 

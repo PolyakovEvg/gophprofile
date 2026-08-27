@@ -9,6 +9,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"go.opentelemetry.io/contrib/instrumentation/github.com/aws/aws-sdk-go-v2/otelaws"
 )
 
 const cacheControl = "public, max-age=31536000, immutable"
@@ -64,6 +65,11 @@ func NewS3Client(cfg S3StorageConfig) *s3.Client {
 			},
 		)
 	}
+
+	otelaws.AppendMiddlewares(
+		&awsCfg.APIOptions,
+		otelaws.WithAttributeBuilder(otelaws.S3AttributeBuilder),
+	)
 
 	return s3.NewFromConfig(awsCfg, func(options *s3.Options) {
 		if cfg.Endpoint == "" {
