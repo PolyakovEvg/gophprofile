@@ -317,8 +317,7 @@ func (s *avatarsService) Create(
 		logger.Error("failed to update upload status", "error", err)
 		return nil, errUploadFailed
 	}
-	metrics.AvatarsStorageBytes.WithLabelValues(userID.String()).
-		Set(float64(avatar.SizeBytes))
+	metrics.AvatarsStorageBytes.Add(float64(avatar.SizeBytes))
 
 	newProcessingStatus := models.ProcessingStatusProcessing
 	avatar, err = s.avatarsRepository.Update(
@@ -558,35 +557,9 @@ func (s *avatarsService) DeleteByID(
 		return errAvatarDeletionFailed
 	}
 
-	s.refreshStorageBytesMetric(ctx, logger, userID)
+	metrics.AvatarsStorageBytes.Sub(float64(avatar.SizeBytes))
 
 	return nil
-}
-
-// refreshStorageBytesMetric keeps the per-user avatars_storage_bytes gauge
-// from leaking a stale value once an avatar is deleted: it either points
-// the gauge at the user's remaining most recent avatar, or drops the
-// label entirely once the user has none left. Best-effort: a failure here
-// must not fail the deletion that already succeeded.
-func (s *avatarsService) refreshStorageBytesMetric(
-	ctx context.Context,
-	logger *slog.Logger,
-	userID uuid.UUID,
-) {
-	remaining, err := s.avatarsRepository.GetForUser(ctx, userID)
-	if err != nil {
-		logger.Error("failed to refresh storage bytes metric after deletion",
-			"error", err, "user_id", userID.String())
-		return
-	}
-
-	if len(remaining) == 0 {
-		metrics.AvatarsStorageBytes.DeleteLabelValues(userID.String())
-		return
-	}
-
-	metrics.AvatarsStorageBytes.WithLabelValues(userID.String()).
-		Set(float64(remaining[0].SizeBytes))
 }
 
 func (s *avatarsService) DeleteLatestForUser(

@@ -425,7 +425,7 @@ func TestAvatarsServiceDeleteByIDQueuesStorageDeletion(t *testing.T) {
 	}
 }
 
-func TestAvatarsServiceDeleteByIDClearsStorageBytesMetricForLastAvatar(t *testing.T) {
+func TestAvatarsServiceDeleteByIDDecrementsStorageBytesMetric(t *testing.T) {
 	ctx := context.Background()
 	userID := uuid.MustParse("11111111-1111-1111-1111-111111111111")
 	avatarID := uuid.MustParse("22222222-2222-2222-2222-222222222222")
@@ -445,10 +445,8 @@ func TestAvatarsServiceDeleteByIDClearsStorageBytesMetricForLastAvatar(t *testin
 		&fakeQueue{},
 	)
 
-	metrics.AvatarsStorageBytes.WithLabelValues(userID.String()).Set(42)
-	if got := testutil.ToFloat64(
-		metrics.AvatarsStorageBytes.WithLabelValues(userID.String()),
-	); got != 42 {
+	metrics.AvatarsStorageBytes.Set(42)
+	if got := testutil.ToFloat64(metrics.AvatarsStorageBytes); got != 42 {
 		t.Fatalf("expected metric to be seeded at 42, got %v", got)
 	}
 
@@ -456,10 +454,8 @@ func TestAvatarsServiceDeleteByIDClearsStorageBytesMetricForLastAvatar(t *testin
 		t.Fatalf("DeleteByID returned error: %v", err)
 	}
 
-	if got := testutil.ToFloat64(
-		metrics.AvatarsStorageBytes.WithLabelValues(userID.String()),
-	); got != 0 {
-		t.Fatalf("expected storage bytes metric to be cleared, got %v", got)
+	if got := testutil.ToFloat64(metrics.AvatarsStorageBytes); got != 0 {
+		t.Fatalf("expected storage bytes metric to be decremented, got %v", got)
 	}
 }
 

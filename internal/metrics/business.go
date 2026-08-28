@@ -25,14 +25,14 @@ var (
 		[]string{"status"},
 	)
 
-	// AvatarsStorageBytes tracks the size of the most recently stored
-	// original avatar file per user.
-	AvatarsStorageBytes = promauto.NewGaugeVec(
+	// AvatarsStorageBytes tracks the aggregate storage used by all stored
+	// original avatar files, in bytes. Unlabeled to avoid a per-user
+	// cardinality blowup in Prometheus.
+	AvatarsStorageBytes = promauto.NewGauge(
 		prometheus.GaugeOpts{
 			Name: "avatars_storage_bytes",
 			Help: "Total storage used by avatars, in bytes.",
 		},
-		[]string{"user_id"},
 	)
 
 	// AvatarsDeletionsTotal counts avatar deletion attempts by outcome.
