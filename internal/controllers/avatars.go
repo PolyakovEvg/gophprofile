@@ -3,15 +3,21 @@ package controllers
 import (
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/pelfox/gophprofile/internal/dto"
+	"github.com/pelfox/gophprofile/internal/logging"
 	"github.com/pelfox/gophprofile/internal/services"
-	"github.com/rs/zerolog"
-	"github.com/rs/zerolog/log"
 )
+
+// fallbackLogger is used by package-level helpers that have no request
+// context, such as WriteJSON failing after headers are already sent. It
+// carries the same "service" field as every other logger in the process
+// so its records stay consistent in log aggregation.
+var fallbackLogger = logging.New("gophprofile")
 
 const (
 	uploadFormSize = 10485760 // 10 MiB
@@ -25,7 +31,7 @@ func WriteJSON(w http.ResponseWriter, code int, payload any) {
 	if err := json.NewEncoder(w).Encode(payload); err != nil {
 		// The status code and part of the body may already be on the wire,
 		// so the response can no longer be changed at this point.
-		log.Error().Err(err).Msg("failed to write JSON response")
+		fallbackLogger.Error("failed to write JSON response", "error", err)
 	}
 }
 
@@ -42,17 +48,17 @@ func WriteErrorDetails(w http.ResponseWriter, code int, message, details string)
 
 // AvatarsController handles avatar HTTP requests.
 type AvatarsController struct {
-	logger         zerolog.Logger
+	logger         *slog.Logger
 	avatarsService services.AvatarsService
 }
 
 // NewAvatarsController creates an avatar HTTP controller.
 func NewAvatarsController(
-	logger zerolog.Logger,
+	logger *slog.Logger,
 	avatarsService services.AvatarsService,
 ) *AvatarsController {
 	return &AvatarsController{
-		logger:         logger.With().Str("controller", "avatars").Logger(),
+		logger:         logger.With("controller", "avatars"),
 		avatarsService: avatarsService,
 	}
 }
@@ -156,10 +162,11 @@ func (c *AvatarsController) GetByID(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "public, max-age=86400")
 	w.WriteHeader(http.StatusOK)
 	if _, err := w.Write(avatar); err != nil {
-		c.logger.Error().
-			Err(err).
-			Str("avatar_id", avatarID.String()).
-			Msg("failed to write avatar response")
+		logging.FromContext(r.Context(), c.logger).Error(
+			"failed to write avatar response",
+			"error", err,
+			"avatar_id", avatarID.String(),
+		)
 	}
 }
 
@@ -264,10 +271,11 @@ func (c *AvatarsController) GetUserAvatar(
 	w.Header().Set("Cache-Control", "public, max-age=86400")
 	w.WriteHeader(http.StatusOK)
 	if _, err := w.Write(avatarBytes); err != nil {
-		c.logger.Error().
-			Err(err).
-			Str("user_id", userID.String()).
-			Msg("failed to write user avatar response")
+		logging.FromContext(r.Context(), c.logger).Error(
+			"failed to write user avatar response",
+			"error", err,
+			"user_id", userID.String(),
+		)
 	}
 }
 

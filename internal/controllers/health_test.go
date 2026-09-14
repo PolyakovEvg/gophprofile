@@ -9,12 +9,12 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/rs/zerolog"
+	"log/slog"
 )
 
 func TestHealthController_Health_AllHealthy(t *testing.T) {
 	controller := NewHealthController(
-		zerolog.Nop(),
+		slog.New(slog.DiscardHandler),
 		NewFuncHealthChecker("database", func(context.Context) error { return nil }),
 		NewFuncHealthChecker("storage", func(context.Context) error { return nil }),
 	)
@@ -45,7 +45,7 @@ func TestHealthController_Health_AllHealthy(t *testing.T) {
 
 func TestHealthController_Health_Degraded(t *testing.T) {
 	controller := NewHealthController(
-		zerolog.Nop(),
+		slog.New(slog.DiscardHandler),
 		NewFuncHealthChecker("database", func(context.Context) error { return nil }),
 		NewFuncHealthChecker("broker", func(context.Context) error {
 			return errors.New("connection refused")

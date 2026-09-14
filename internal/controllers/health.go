@@ -2,9 +2,10 @@ package controllers
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
 
-	"github.com/rs/zerolog"
+	"github.com/pelfox/gophprofile/internal/logging"
 )
 
 // HealthChecker reports the availability of a single dependency.
@@ -55,23 +56,24 @@ type healthResponse struct {
 
 // HealthController reports the health of the service and its dependencies.
 type HealthController struct {
-	logger   zerolog.Logger
+	logger   *slog.Logger
 	checkers []HealthChecker
 }
 
 // NewHealthController creates a health HTTP controller.
 func NewHealthController(
-	logger zerolog.Logger,
+	logger *slog.Logger,
 	checkers ...HealthChecker,
 ) *HealthController {
 	return &HealthController{
-		logger:   logger.With().Str("controller", "health").Logger(),
+		logger:   logger.With("controller", "health"),
 		checkers: checkers,
 	}
 }
 
 // Health handles healthcheck requests, probing every registered dependency.
 func (c *HealthController) Health(w http.ResponseWriter, r *http.Request) {
+	logger := logging.FromContext(r.Context(), c.logger)
 	components := make(map[string]componentStatus, len(c.checkers))
 	healthy := true
 
@@ -79,10 +81,10 @@ func (c *HealthController) Health(w http.ResponseWriter, r *http.Request) {
 		if err := checker.Check(r.Context()); err != nil {
 			healthy = false
 			components[checker.Name()] = componentStatus{Status: "error"}
-			c.logger.Error().
-				Err(err).
-				Str("component", checker.Name()).
-				Msg("health check failed")
+			logger.Error("health check failed",
+				"error", err,
+				"component", checker.Name(),
+			)
 			continue
 		}
 

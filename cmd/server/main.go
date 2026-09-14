@@ -1,23 +1,39 @@
 package main
 
 import (
+	"context"
 	"os"
 
 	"github.com/pelfox/gophprofile/internal/app"
 	"github.com/pelfox/gophprofile/internal/config"
-	"github.com/rs/zerolog"
+	"github.com/pelfox/gophprofile/internal/logging"
+	"github.com/pelfox/gophprofile/internal/telemetry"
 )
 
 func main() {
-	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
-	logger := zerolog.New(os.Stdout).With().Timestamp().Logger()
-
 	cfg, err := config.Load()
+	logger := logging.New("gophprofile-server")
 	if err != nil {
-		logger.Fatal().Err(err).Msg("failed to load configuration")
+		logger.Error("failed to load configuration", "error", err)
+		os.Exit(1)
+	}
+	logger = logging.New(cfg.OTELServiceName)
+
+	ctx := context.Background()
+	shutdown, err := telemetry.Setup(ctx, cfg.OTELServiceName, cfg.OTELExporterEndpoint)
+	if err != nil {
+		logger.Error("failed to set up telemetry", "error", err)
+		os.Exit(1)
 	}
 
-	if err := app.Run(logger, cfg); err != nil {
-		logger.Fatal().Err(err).Msg("failed to run the application")
+	runErr := app.Run(logger, cfg)
+
+	if err := shutdown(context.Background()); err != nil {
+		logger.Error("failed to shut down telemetry", "error", err)
+	}
+
+	if runErr != nil {
+		logger.Error("failed to run the application", "error", runErr)
+		os.Exit(1)
 	}
 }

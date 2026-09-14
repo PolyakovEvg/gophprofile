@@ -9,20 +9,28 @@ import (
 	"image"
 	"image/jpeg"
 	_ "image/png"
+	"log/slog"
+	"net/http"
 	"path"
 	"strconv"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/google/uuid"
 	"github.com/pelfox/gophprofile/internal/config"
+	"github.com/pelfox/gophprofile/internal/controllers"
+	"github.com/pelfox/gophprofile/internal/logging"
+	"github.com/pelfox/gophprofile/internal/metrics"
 	"github.com/pelfox/gophprofile/internal/models"
 	"github.com/pelfox/gophprofile/internal/queue"
 	"github.com/pelfox/gophprofile/internal/storage"
+	"github.com/pelfox/gophprofile/internal/tracing"
 	"github.com/pelfox/gophprofile/pkg"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	amqp "github.com/rabbitmq/amqp091-go"
-	"github.com/rs/zerolog"
 	"golang.org/x/image/draw"
 	_ "golang.org/x/image/webp"
+	"golang.org/x/sync/errgroup"
 )
 
 const (
@@ -53,7 +61,7 @@ var thumbnailSizes = []thumbnailSize{
 }
 
 type processor struct {
-	logger  zerolog.Logger
+	logger  *slog.Logger
 	queue   queue.PublisherProvider
 	storage storage.Provider
 }
@@ -61,7 +69,7 @@ type processor struct {
 // Run starts the avatar resize worker.
 func Run(
 	ctx context.Context,
-	logger zerolog.Logger,
+	logger *slog.Logger,
 	cfg *config.WorkerConfig,
 ) error {
 	conn, err := amqp.Dial(cfg.RabbitMQURL)
@@ -70,30 +78,87 @@ func Run(
 	}
 	defer conn.Close()
 
-	queueProvider, err := queue.NewRabbitMQQueue(logger, conn)
+	queueProvider, err := queue.NewRabbitMQQueue(conn)
 	if err != nil {
 		return err
 	}
 	defer queueProvider.Close()
 
+	s3Client := storage.NewS3Client(storage.S3StorageConfig{
+		Region:    cfg.S3Region,
+		Endpoint:  cfg.S3Endpoint,
+		AccessKey: cfg.S3AccessKey,
+		SecretKey: cfg.S3SecretKey,
+		Bucket:    cfg.S3Bucket,
+	})
+
 	processor := &processor{
-		logger: logger.With().Str("worker", "avatar").Logger(),
-		queue:  queueProvider,
-		storage: storage.NewS3StorageFromConfig(storage.S3StorageConfig{
-			Region:    cfg.S3Region,
-			Endpoint:  cfg.S3Endpoint,
-			AccessKey: cfg.S3AccessKey,
-			SecretKey: cfg.S3SecretKey,
-			Bucket:    cfg.S3Bucket,
-		}),
+		logger:  logger.With("worker", "avatar"),
+		queue:   queueProvider,
+		storage: storage.NewS3Storage(s3Client, cfg.S3Bucket, cfg.S3Endpoint),
 	}
 
-	return consumeQueues(ctx, processor.logger, conn, processor)
+	if err := metrics.WatchQueueDepths(ctx, logger, conn, []string{
+		queue.ResizeQueueName,
+		queue.DeleteQueueName,
+	}); err != nil {
+		return fmt.Errorf("failed to start queue depth watcher: %w", err)
+	}
+
+	healthController := controllers.NewHealthController(
+		logger,
+		controllers.NewFuncHealthChecker("storage", func(ctx context.Context) error {
+			_, err := s3Client.HeadBucket(ctx, &s3.HeadBucketInput{
+				Bucket: &cfg.S3Bucket,
+			})
+			return err
+		}),
+		controllers.NewFuncHealthChecker("broker", func(_ context.Context) error {
+			if conn.IsClosed() {
+				return errors.New("rabbitmq connection is closed")
+			}
+			return nil
+		}),
+	)
+
+	metricsServer := &http.Server{
+		Addr:    cfg.MetricsAddr,
+		Handler: metricsRouter(healthController),
+	}
+
+	group, groupCtx := errgroup.WithContext(ctx)
+	group.Go(func() error {
+		return consumeQueues(groupCtx, processor.logger, conn, processor)
+	})
+	group.Go(func() error {
+		logger.Info("started metrics server", "addr", cfg.MetricsAddr)
+		if err := metricsServer.ListenAndServe(); err != nil &&
+			!errors.Is(err, http.ErrServerClosed) {
+			return fmt.Errorf("failed to run metrics server: %w", err)
+		}
+		return nil
+	})
+
+	<-groupCtx.Done()
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	shutdownErr := metricsServer.Shutdown(shutdownCtx)
+	if err := group.Wait(); err != nil {
+		return err
+	}
+	return shutdownErr
+}
+
+func metricsRouter(healthController *controllers.HealthController) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", healthController.Health)
+	mux.Handle("/metrics", promhttp.Handler())
+	return mux
 }
 
 func consumeQueues(
 	ctx context.Context,
-	logger zerolog.Logger,
+	logger *slog.Logger,
 	conn *amqp.Connection,
 	processor *processor,
 ) error {
@@ -153,7 +218,7 @@ func consumeQueues(
 		return fmt.Errorf("failed to consume delete queue: %w", err)
 	}
 
-	logger.Info().Msg("started avatar worker")
+	logger.Info("started avatar worker")
 	for {
 		select {
 		case <-ctx.Done():
@@ -163,8 +228,8 @@ func consumeQueues(
 				return errors.New("resize queue consumer closed")
 			}
 
-			if err := processor.processResize(ctx, delivery.Body); err != nil {
-				logger.Error().Err(err).Msg("failed to process resize job")
+			if err := processor.processResize(ctx, delivery); err != nil {
+				logger.Error("failed to process resize job", "error", err)
 				if err := handleFailedDelivery(
 					channel, logger, delivery, resizeRetryQueue.Name, err,
 				); err != nil {
@@ -181,8 +246,8 @@ func consumeQueues(
 				return errors.New("delete queue consumer closed")
 			}
 
-			if err := processor.processDelete(ctx, delivery.Body); err != nil {
-				logger.Error().Err(err).Msg("failed to process delete job")
+			if err := processor.processDelete(ctx, delivery); err != nil {
+				logger.Error("failed to process delete job", "error", err)
 				if err := handleFailedDelivery(
 					channel, logger, delivery, deleteRetryQueue.Name, err,
 				); err != nil {
@@ -247,7 +312,7 @@ func declareRetryQueue(
 // message back into the original queue for reprocessing.
 func handleFailedDelivery(
 	channel *amqp.Channel,
-	logger zerolog.Logger,
+	logger *slog.Logger,
 	delivery amqp.Delivery,
 	retryQueueName string,
 	processingErr error,
@@ -262,10 +327,8 @@ func handleFailedDelivery(
 
 	attempt := retryAttempt(delivery.Headers) + 1
 	if attempt > maxRetryAttempts {
-		logger.Error().
-			Err(processingErr).
-			Int("attempts", attempt-1).
-			Msg("giving up after exhausting retry attempts")
+		logger.Error("giving up after exhausting retry attempts",
+			"error", processingErr, "attempts", attempt-1)
 		if err := delivery.Ack(false); err != nil {
 			return fmt.Errorf("failed to drop poison job: %w", err)
 		}
@@ -294,20 +357,17 @@ func handleFailedDelivery(
 		},
 	)
 	if err != nil {
-		logger.Error().
-			Err(err).
-			Msg("failed to schedule retry, requeueing immediately instead")
+		logger.Error("failed to schedule retry, requeueing immediately instead",
+			"error", err)
 		if nackErr := delivery.Nack(false, true); nackErr != nil {
 			return fmt.Errorf("failed to requeue job: %w", nackErr)
 		}
 		return nil
 	}
 
-	logger.Warn().
-		Err(processingErr).
-		Int("attempt", attempt).
-		Dur("delay", delay).
-		Msg("scheduled job retry with backoff")
+	metrics.AvatarsJobRetriesTotal.WithLabelValues(retryQueueName).Inc()
+	logger.Warn("scheduled job retry with backoff",
+		"error", processingErr, "attempt", attempt, "delay", delay)
 
 	if err := delivery.Ack(false); err != nil {
 		return fmt.Errorf("failed to acknowledge job pending retry: %w", err)
@@ -336,9 +396,27 @@ func backoffDelay(attempt int) time.Duration {
 	return delay
 }
 
-func (p *processor) processResize(ctx context.Context, body []byte) error {
+func (p *processor) processResize(
+	ctx context.Context,
+	delivery amqp.Delivery,
+) (err error) {
+	ctx, span := queue.StartConsumerSpan(ctx, delivery.Headers, queue.ResizeQueueName)
+	defer span.End()
+
+	defer tracing.RecordSpanErr(span, &err)
+
+	start := time.Now()
+	defer func() {
+		status := "success"
+		if err != nil {
+			status = "error"
+		}
+		metrics.AvatarsResizeDuration.WithLabelValues(status).
+			Observe(time.Since(start).Seconds())
+	}()
+
 	var message pkg.MessageResizeRequest
-	if err := json.Unmarshal(body, &message); err != nil {
+	if err := json.Unmarshal(delivery.Body, &message); err != nil {
 		return fmt.Errorf("failed to unmarshal resize request: %w", err)
 	}
 	if message.ID == uuid.Nil {
@@ -354,13 +432,11 @@ func (p *processor) processResize(ctx context.Context, body []byte) error {
 		return errors.New("resize request does not contain avatar storage key")
 	}
 
-	logger := p.logger.With().
-		Str("avatar_id", message.ID.String()).
-		Logger()
+	logger := logging.FromContext(ctx, p.logger).With("avatar_id", message.ID.String())
 
 	thumbnailKeys, err := p.createThumbnails(ctx, message)
 	if err != nil {
-		logger.Error().Err(err).Msg("failed to create thumbnails")
+		logger.Error("failed to create thumbnails", "error", err)
 		return fmt.Errorf("failed to create thumbnails: %w", err)
 	}
 
@@ -374,13 +450,20 @@ func (p *processor) processResize(ctx context.Context, body []byte) error {
 		return fmt.Errorf("failed to publish resize completion: %w", err)
 	}
 
-	logger.Info().Msg("processed resize job")
+	logger.Info("processed resize job")
 	return nil
 }
 
-func (p *processor) processDelete(ctx context.Context, body []byte) error {
+func (p *processor) processDelete(
+	ctx context.Context,
+	delivery amqp.Delivery,
+) (err error) {
+	ctx, span := queue.StartConsumerSpan(ctx, delivery.Headers, queue.DeleteQueueName)
+	defer span.End()
+	defer tracing.RecordSpanErr(span, &err)
+
 	var message pkg.MessageDeleteRequest
-	if err := json.Unmarshal(body, &message); err != nil {
+	if err := json.Unmarshal(delivery.Body, &message); err != nil {
 		return fmt.Errorf("failed to unmarshal delete request: %w", err)
 	}
 	if message.ID == uuid.Nil {
@@ -391,9 +474,8 @@ func (p *processor) processDelete(ctx context.Context, body []byte) error {
 		return err
 	}
 
-	p.logger.Info().
-		Str("avatar_id", message.ID.String()).
-		Msg("processed delete job")
+	logging.FromContext(ctx, p.logger).Info("processed delete job",
+		"avatar_id", message.ID.String())
 	return nil
 }
 

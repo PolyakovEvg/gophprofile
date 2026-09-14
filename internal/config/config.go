@@ -26,6 +26,11 @@ type AppConfig struct {
 	S3SecretKey string `env:"S3_SECRET_KEY" env-required:"true"`
 	// S3Bucket is the bucket used for avatar object storage.
 	S3Bucket string `env:"S3_BUCKET" env-required:"true"`
+
+	// OTELServiceName identifies this service in traces.
+	OTELServiceName string `env:"OTEL_SERVICE_NAME" env-default:"gophprofile-server"`
+	// OTELExporterEndpoint is the OTLP/gRPC endpoint traces are exported to.
+	OTELExporterEndpoint string `env:"OTEL_EXPORTER_OTLP_ENDPOINT" env-default:"localhost:4317"`
 }
 
 // Load loads AppConfig from .env and environment variables.
@@ -56,6 +61,13 @@ type WorkerConfig struct {
 	S3SecretKey string `env:"S3_SECRET_KEY" env-required:"true"`
 	// S3Bucket is the bucket used for avatar object storage.
 	S3Bucket string `env:"S3_BUCKET" env-required:"true"`
+
+	// OTELServiceName identifies this service in traces.
+	OTELServiceName string `env:"OTEL_SERVICE_NAME" env-default:"gophprofile-worker"`
+	// OTELExporterEndpoint is the OTLP/gRPC endpoint traces are exported to.
+	OTELExporterEndpoint string `env:"OTEL_EXPORTER_OTLP_ENDPOINT" env-default:"localhost:4317"`
+	// MetricsAddr is the address the /health and /metrics HTTP server listens on.
+	MetricsAddr string `env:"METRICS_ADDR" env-default:":9091"`
 }
 
 func LoadWorkerConfig() (*WorkerConfig, error) {

@@ -17,7 +17,7 @@ import (
 	"github.com/pelfox/gophprofile/internal/models"
 	"github.com/pelfox/gophprofile/internal/services"
 	"github.com/pelfox/gophprofile/pkg"
-	"github.com/rs/zerolog"
+	"log/slog"
 )
 
 type fakeAvatarsService struct {
@@ -155,7 +155,7 @@ func TestAvatarsControllerUploadCreatesAvatar(t *testing.T) {
 			UpdatedAt:        now,
 		},
 	}
-	controller := NewAvatarsController(zerolog.Nop(), service)
+	controller := NewAvatarsController(slog.New(slog.DiscardHandler), service)
 
 	req := multipartRequest(t, userID.String(), "avatar_file", []byte("payload"))
 	rec := httptest.NewRecorder()
@@ -191,7 +191,7 @@ func TestAvatarsControllerUploadCreatesAvatar(t *testing.T) {
 
 func TestAvatarsControllerUploadValidatesUserID(t *testing.T) {
 	service := &fakeAvatarsService{}
-	controller := NewAvatarsController(zerolog.Nop(), service)
+	controller := NewAvatarsController(slog.New(slog.DiscardHandler), service)
 
 	req := multipartRequest(t, "not-a-uuid", "avatar_file", []byte("payload"))
 	rec := httptest.NewRecorder()
@@ -208,7 +208,7 @@ func TestAvatarsControllerUploadValidatesUserID(t *testing.T) {
 
 func TestAvatarsControllerUploadRequiresAvatarFile(t *testing.T) {
 	service := &fakeAvatarsService{}
-	controller := NewAvatarsController(zerolog.Nop(), service)
+	controller := NewAvatarsController(slog.New(slog.DiscardHandler), service)
 
 	req := multipartRequest(t, uuid.NewString(), "wrong_field", []byte("payload"))
 	rec := httptest.NewRecorder()
@@ -251,7 +251,7 @@ func TestAvatarsControllerUploadMapsServiceErrors(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			service := &fakeAvatarsService{createErr: tt.err}
-			controller := NewAvatarsController(zerolog.Nop(), service)
+			controller := NewAvatarsController(slog.New(slog.DiscardHandler), service)
 			req := multipartRequest(t, uuid.NewString(), "avatar_file", []byte("payload"))
 			rec := httptest.NewRecorder()
 
@@ -267,7 +267,7 @@ func TestAvatarsControllerUploadMapsServiceErrors(t *testing.T) {
 
 func TestAvatarsControllerUploadFileTooLargeReturnsMaxSize(t *testing.T) {
 	service := &fakeAvatarsService{createErr: services.ErrFileTooLarge}
-	controller := NewAvatarsController(zerolog.Nop(), service)
+	controller := NewAvatarsController(slog.New(slog.DiscardHandler), service)
 	req := multipartRequest(t, uuid.NewString(), "avatar_file", []byte("payload"))
 	rec := httptest.NewRecorder()
 
@@ -295,7 +295,7 @@ func TestAvatarsControllerUploadFileTooLargeReturnsMaxSize(t *testing.T) {
 
 func TestAvatarsControllerUploadUnsupportedFileReturnsDetails(t *testing.T) {
 	service := &fakeAvatarsService{createErr: services.ErrUnsupportedFile}
-	controller := NewAvatarsController(zerolog.Nop(), service)
+	controller := NewAvatarsController(slog.New(slog.DiscardHandler), service)
 	req := multipartRequest(t, uuid.NewString(), "avatar_file", []byte("payload"))
 	rec := httptest.NewRecorder()
 
@@ -323,7 +323,7 @@ func TestAvatarsControllerGetByIDReturnsAvatarBytes(t *testing.T) {
 		getByIDMimeType: "image/png",
 		getByIDPayload:  []byte("avatar"),
 	}
-	controller := NewAvatarsController(zerolog.Nop(), service)
+	controller := NewAvatarsController(slog.New(slog.DiscardHandler), service)
 
 	req := requestWithAvatarID(http.MethodGet, "/avatars/"+avatarID.String(), avatarID.String())
 	rec := httptest.NewRecorder()
@@ -365,7 +365,7 @@ func TestAvatarsControllerGetMetadataReturnsJSON(t *testing.T) {
 			UpdatedAt:        time.Now(),
 		},
 	}
-	controller := NewAvatarsController(zerolog.Nop(), service)
+	controller := NewAvatarsController(slog.New(slog.DiscardHandler), service)
 
 	req := requestWithAvatarID(http.MethodGet, "/avatars/"+avatarID.String()+"/metadata", avatarID.String())
 	rec := httptest.NewRecorder()
@@ -427,7 +427,7 @@ func TestAvatarsControllerDeleteMapsResponses(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			service := &fakeAvatarsService{deleteErr: tt.err}
-			controller := NewAvatarsController(zerolog.Nop(), service)
+			controller := NewAvatarsController(slog.New(slog.DiscardHandler), service)
 			req := requestWithAvatarID(
 				http.MethodDelete,
 				"/avatars/"+avatarID.String(),
@@ -464,7 +464,7 @@ func TestAvatarsControllerGetUserAvatarReturnsAvatarBytes(t *testing.T) {
 		getByUserIDMimeType: "image/png",
 		getByUserIDPayload:  []byte("avatar"),
 	}
-	controller := NewAvatarsController(zerolog.Nop(), service)
+	controller := NewAvatarsController(slog.New(slog.DiscardHandler), service)
 
 	req := requestWithUserID(
 		http.MethodGet,
@@ -488,7 +488,7 @@ func TestAvatarsControllerGetUserAvatarReturnsAvatarBytes(t *testing.T) {
 func TestAvatarsControllerGetUserAvatarNotFound(t *testing.T) {
 	userID := uuid.MustParse("11111111-1111-1111-1111-111111111111")
 	service := &fakeAvatarsService{getByUserIDErr: services.ErrAvatarNotFound}
-	controller := NewAvatarsController(zerolog.Nop(), service)
+	controller := NewAvatarsController(slog.New(slog.DiscardHandler), service)
 
 	req := requestWithUserID(
 		http.MethodGet,
@@ -534,7 +534,7 @@ func TestAvatarsControllerDeleteUserAvatarMapsResponses(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			service := &fakeAvatarsService{deleteLatestErr: tt.err}
-			controller := NewAvatarsController(zerolog.Nop(), service)
+			controller := NewAvatarsController(slog.New(slog.DiscardHandler), service)
 			req := requestWithUserID(
 				http.MethodDelete,
 				"/users/"+userID.String()+"/avatar",
@@ -587,7 +587,7 @@ func TestAvatarsControllerListUserAvatarsReturnsJSON(t *testing.T) {
 			},
 		},
 	}
-	controller := NewAvatarsController(zerolog.Nop(), service)
+	controller := NewAvatarsController(slog.New(slog.DiscardHandler), service)
 
 	req := requestWithUserID(
 		http.MethodGet,

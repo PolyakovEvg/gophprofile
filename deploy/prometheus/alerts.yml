@@ -1,0 +1,42 @@
+groups:
+  - name: gophprofile
+    rules:
+      - alert: HighErrorRate
+        expr: >
+          (
+            sum(rate(avatars_uploads_total{status="error"}[5m]))
+            /
+            sum(rate(avatars_uploads_total[5m]))
+          ) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High avatar upload error rate"
+          description: >
+            More than 10% of avatar uploads have failed over the last 5
+            minutes.
+
+      - alert: HighResponseTime
+        expr: >
+          histogram_quantile(
+            0.95,
+            sum(rate(http_request_duration_seconds_bucket[5m])) by (le, route)
+          ) > 5
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High HTTP response latency"
+          description: >
+            The 95th percentile HTTP request duration has exceeded 5 seconds
+            for at least 2 minutes.
+
+      - alert: ServiceDown
+        expr: up{job=~"gophprofile-.*"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "GophProfile target down"
+          description: "Prometheus has not been able to scrape {{ $labels.job }} for 1 minute."

@@ -89,6 +89,8 @@ services:
       S3_ACCESS_KEY: "gophprofile"
       S3_SECRET_KEY: "gophprofile123"
       S3_BUCKET: "avatars"
+      OTEL_SERVICE_NAME: "gophprofile-server"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "jaeger:4317"
     depends_on:
       postgres:
         condition: service_healthy
@@ -98,12 +100,16 @@ services:
         condition: service_completed_successfully
       migrate:
         condition: service_completed_successfully
+      jaeger:
+        condition: service_started
 
   worker:
     build:
       context: .
     restart: unless-stopped
     command: ["./worker"]
+    ports:
+      - "9091:9091"
     environment:
       DATABASE_URL: "postgres://gophprofile:gophprofile@postgres:5432/gophprofile?sslmode=disable"
       RABBITMQ_URL: "amqp://gophprofile:gophprofile@rabbitmq:5672/"
@@ -112,6 +118,9 @@ services:
       S3_ACCESS_KEY: "gophprofile"
       S3_SECRET_KEY: "gophprofile123"
       S3_BUCKET: "avatars"
+      OTEL_SERVICE_NAME: "gophprofile-worker"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "jaeger:4317"
+      METRICS_ADDR: ":9091"
     depends_on:
       postgres:
         condition: service_healthy
@@ -121,7 +130,80 @@ services:
         condition: service_completed_successfully
       migrate:
         condition: service_completed_successfully
+      jaeger:
+        condition: service_started
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.62.0
+    restart: unless-stopped
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"
+      - "4317:4317"
+      - "4318:4318"
+
+  prometheus:
+    image: prom/prometheus:v3.0.1
+    restart: unless-stopped
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./deploy/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    depends_on:
+      - alertmanager
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    restart: unless-stopped
+    volumes:
+      - ./deploy/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    ports:
+      - "9093:9093"
+
+  loki:
+    image: grafana/loki:3.3.2
+    restart: unless-stopped
+    command: ["-config.file=/etc/loki/loki-config.yml"]
+    volumes:
+      - ./deploy/loki/loki-config.yml:/etc/loki/loki-config.yml:ro
+      - loki-data:/loki
+    ports:
+      - "3100:3100"
+
+  promtail:
+    image: grafana/promtail:3.3.2
+    restart: unless-stopped
+    command: ["-config.file=/etc/promtail/promtail-config.yml"]
+    volumes:
+      - ./deploy/promtail/promtail-config.yml:/etc/promtail/promtail-config.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+    depends_on:
+      - loki
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+      - loki
+      - jaeger
 
 volumes:
   postgres-data:
   minio-data:
+  prometheus-data:
+  loki-data:
+  grafana-data:
