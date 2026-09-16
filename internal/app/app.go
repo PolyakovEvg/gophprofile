@@ -2,7 +2,6 @@ package app
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,22 +16,20 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/exaring/otelpgx"
 	"github.com/go-chi/chi/v5"
-	"github.com/golang-migrate/migrate/v4"
-	migratepgx "github.com/golang-migrate/migrate/v4/database/pgx/v5"
-	"github.com/golang-migrate/migrate/v4/source/iofs"
+	"github.com/go-chi/httprate"
 	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/pelfox/gophprofile/internal/config"
 	"github.com/pelfox/gophprofile/internal/controllers"
 	"github.com/pelfox/gophprofile/internal/logging"
 	"github.com/pelfox/gophprofile/internal/metrics"
+	"github.com/pelfox/gophprofile/internal/migrate"
 	"github.com/pelfox/gophprofile/internal/queue"
 	"github.com/pelfox/gophprofile/internal/repositories"
 	"github.com/pelfox/gophprofile/internal/services"
 	"github.com/pelfox/gophprofile/internal/storage"
 	"github.com/pelfox/gophprofile/internal/telemetry"
 	"github.com/pelfox/gophprofile/internal/tracing"
-	"github.com/pelfox/gophprofile/migrations"
 	"github.com/pelfox/gophprofile/pkg"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -67,7 +64,7 @@ func Run(logger *slog.Logger, cfg *config.AppConfig) error {
 		return fmt.Errorf("failed to connect to database: %w", err)
 	}
 
-	if err := runMigrations(cfg.DatabaseURL); err != nil {
+	if err := migrate.Up(cfg.DatabaseURL); err != nil {
 		return fmt.Errorf("failed to apply database migrations: %w", err)
 	}
 
@@ -77,7 +74,7 @@ func Run(logger *slog.Logger, cfg *config.AppConfig) error {
 	}
 	defer conn.Close()
 
-	queueProvider, err := queue.NewRabbitMQQueue(conn)
+	queueProvider, err := queue.NewRabbitMQQueue(conn, logger)
 	if err != nil {
 		return err
 	}
@@ -91,11 +88,11 @@ func Run(logger *slog.Logger, cfg *config.AppConfig) error {
 		Bucket:    cfg.S3Bucket,
 	})
 
-	avatarsRepository := repositories.NewAvatarsRepository(pool)
+	avatarsRepository := repositories.NewAvatarsRepository(pool, logger)
 	avatarsService := services.NewAvatarsService(
 		logger,
 		avatarsRepository,
-		storage.NewS3Storage(s3Client, cfg.S3Bucket, cfg.S3Endpoint),
+		storage.NewS3Storage(s3Client, cfg.S3Bucket, cfg.S3Endpoint, logger),
 		queueProvider,
 	)
 	avatarsController := controllers.NewAvatarsController(
@@ -122,7 +119,7 @@ func Run(logger *slog.Logger, cfg *config.AppConfig) error {
 	)
 
 	handler := otelhttp.NewHandler(
-		newRouter(avatarsController, healthController),
+		newRouter(avatarsController, healthController, cfg),
 		"http-server",
 	)
 	server := &http.Server{
@@ -164,6 +161,7 @@ func Run(logger *slog.Logger, cfg *config.AppConfig) error {
 func newRouter(
 	avatarsController *controllers.AvatarsController,
 	healthController *controllers.HealthController,
+	cfg *config.AppConfig,
 ) http.Handler {
 	router := chi.NewRouter()
 	router.Use(metrics.HTTPMiddleware)
@@ -171,9 +169,30 @@ func newRouter(
 	router.Get("/", func(w http.ResponseWriter, r *http.Request) {
 		http.ServeFile(w, r, "web/index.html")
 	})
+	// livez only reports that the process is up and serving; it deliberately
+	// does not probe dependencies so a transient DB/broker/S3 outage does not
+	// cause Kubernetes to restart otherwise-healthy pods. Use /health, which
+	// does probe dependencies, for the readiness probe instead.
+	router.Get("/livez", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
 	router.Get("/health", healthController.Health)
 	router.Handle("/metrics", promhttp.Handler())
 	router.Route("/api/v1", func(router chi.Router) {
+		// Rate limiting only applies to the API itself: /health, /livez and
+		// /metrics must stay reachable for Kubernetes probes and Prometheus
+		// scraping even while a client is being throttled.
+		router.Use(httprate.Limit(
+			cfg.RateLimitRequests,
+			cfg.RateLimitWindow,
+			httprate.WithKeyByIP(),
+			httprate.WithLimitHandler(func(w http.ResponseWriter, r *http.Request) {
+				controllers.WriteError(w, http.StatusTooManyRequests, "rate limit exceeded")
+			}),
+		))
+		router.Get("/openapi.yaml", func(w http.ResponseWriter, r *http.Request) {
+			http.ServeFile(w, r, "api/openapi.yaml")
+		})
 		router.Post("/avatars", avatarsController.Upload)
 		router.Get("/avatars/{avatarID}", avatarsController.GetByID)
 		router.Get("/avatars/{avatarID}/metadata", avatarsController.GetMetadata)
@@ -281,35 +300,6 @@ func handleResizeDoneDelivery(
 	if err := delivery.Ack(false); err != nil {
 		return fmt.Errorf("failed to acknowledge resize done message: %w", err)
 	}
-	return nil
-}
-
-func runMigrations(databaseURL string) error {
-	db, err := sql.Open("pgx", databaseURL)
-	if err != nil {
-		return fmt.Errorf("failed to open migration database connection: %w", err)
-	}
-	defer db.Close()
-
-	driver, err := migratepgx.WithInstance(db, &migratepgx.Config{})
-	if err != nil {
-		return fmt.Errorf("failed to initialize migration driver: %w", err)
-	}
-
-	source, err := iofs.New(migrations.Files, ".")
-	if err != nil {
-		return fmt.Errorf("failed to load embedded migrations: %w", err)
-	}
-
-	migrator, err := migrate.NewWithInstance("iofs", source, "pgx5", driver)
-	if err != nil {
-		return fmt.Errorf("failed to initialize migrator: %w", err)
-	}
-
-	if err := migrator.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
-		return fmt.Errorf("failed to apply migrations: %w", err)
-	}
-
 	return nil
 }
 

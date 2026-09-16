@@ -1,0 +1,219 @@
+# Default values for gophprofile.
+# Tuned for a local single-node cluster (Rancher Desktop / k3s). See
+# values-prod.yaml for an overlay suited to a real cluster with managed
+# infrastructure and stricter resource limits.
+
+image:
+  repository: gophprofile
+  tag: local
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# Non-secret configuration, rendered into a ConfigMap and mounted as
+# environment variables on both the server and the worker.
+config:
+  s3Region: us-east-1
+  s3Endpoint: "http://gophprofile-minio:9000"
+  s3Bucket: avatars
+  # OTLP/gRPC endpoint for trace export, e.g. an otel-collector or Jaeger
+  # already running in the cluster. Tracing is best-effort: the app starts
+  # fine and simply drops spans if this is unset/unreachable, so deploying a
+  # tracing backend is optional and out of scope for this chart.
+  otelExporterEndpoint: ""
+  # Requests a single client IP may make to /api/v1/* within rateLimitWindow
+  # before the server starts returning 429s.
+  rateLimitRequests: 120
+  rateLimitWindow: 1m
+
+# Secret values. When existingSecret is empty, the chart renders a Secret
+# from the values below (fine for local/dev). In production, set
+# existingSecret to the name of a Secret you manage out-of-band (e.g. via
+# External Secrets/Vault) instead of storing credentials in values files.
+secret:
+  existingSecret: ""
+  databaseURL: "postgres://gophprofile:gophprofile@gophprofile-postgres:5432/gophprofile?sslmode=disable"
+  rabbitmqURL: "amqp://gophprofile:gophprofile@gophprofile-rabbitmq:5672/"
+  s3AccessKey: gophprofile
+  s3SecretKey: gophprofile123
+
+serviceAccount:
+  create: true
+  # The app never calls the Kubernetes API, so no Role/RoleBinding is
+  # granted and the pod's own service account token is not mounted.
+  automount: false
+  annotations: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 100
+  runAsGroup: 101
+  fsGroup: 101
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+server:
+  name: server
+  replicaCount: 2
+  containerPort: 8080
+  otelServiceName: gophprofile-server
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+  probes:
+    liveness:
+      path: /livez
+      initialDelaySeconds: 5
+      periodSeconds: 10
+      timeoutSeconds: 2
+      failureThreshold: 3
+    readiness:
+      path: /health
+      initialDelaySeconds: 5
+      periodSeconds: 10
+      timeoutSeconds: 3
+      failureThreshold: 3
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+    targetMemoryUtilizationPercentage: 80
+  service:
+    type: ClusterIP
+    port: 80
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+worker:
+  name: worker
+  replicaCount: 2
+  metricsPort: 9091
+  otelServiceName: gophprofile-worker
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+  probes:
+    liveness:
+      path: /livez
+      initialDelaySeconds: 5
+      periodSeconds: 10
+      timeoutSeconds: 2
+      failureThreshold: 3
+    readiness:
+      path: /health
+      initialDelaySeconds: 5
+      periodSeconds: 10
+      timeoutSeconds: 3
+      failureThreshold: 3
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 8
+    targetCPUUtilizationPercentage: 70
+    targetMemoryUtilizationPercentage: 80
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+ingress:
+  enabled: true
+  # Rancher Desktop's bundled k3s ships Traefik by default; switch to
+  # "nginx" if you installed the ingress-nginx controller instead.
+  className: traefik
+  host: gophprofile.local
+  annotations: {}
+  tls:
+    enabled: false
+    secretName: ""
+
+serviceMonitor:
+  # Requires the Prometheus Operator CRDs (e.g. from the kube-prometheus-stack
+  # chart) to be installed in the cluster.
+  enabled: true
+  interval: 30s
+  scrapeTimeout: 10s
+  # Labels added to the ServiceMonitor object itself so an operator-managed
+  # Prometheus can select it (kube-prometheus-stack defaults to release=<name>).
+  additionalLabels: {}
+
+networkPolicy:
+  enabled: true
+  # Namespace the ingress controller runs in, so the server's ingress rule
+  # can allow traffic from it. Rancher Desktop's Traefik runs in kube-system.
+  ingressNamespaceLabel:
+    kubernetes.io/metadata.name: kube-system
+  # Namespace the Prometheus Operator's Prometheus pods run in, allowed to
+  # reach the /metrics port on both server and worker.
+  monitoringNamespaceLabel:
+    kubernetes.io/metadata.name: monitoring
+
+migrationHook:
+  enabled: true
+  backoffLimit: 3
+  activeDeadlineSeconds: 120
+
+# --- Bundled development dependencies -------------------------------------
+# These render simple, single-replica Deployments for Postgres, RabbitMQ,
+# and MinIO so `helm install` stands up a complete stack on a local cluster,
+# mirroring docker-compose. Disable them (see values-prod.yaml) and point
+# secret.databaseURL / rabbitmqURL / s3* at managed services in production.
+
+postgresql:
+  enabled: true
+  image: postgres:18-alpine
+  auth:
+    user: gophprofile
+    password: gophprofile
+    database: gophprofile
+  persistence:
+    enabled: true
+    size: 1Gi
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits: { cpu: 500m, memory: 512Mi }
+
+rabbitmq:
+  enabled: true
+  image: rabbitmq:4-management-alpine
+  auth:
+    user: gophprofile
+    password: gophprofile
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits: { cpu: 500m, memory: 512Mi }
+
+minio:
+  enabled: true
+  # MinIO pulled these off Docker Hub in 2025; anonymous pulls of
+  # minio/minio and minio/mc now get "pull access denied" there, so these
+  # point at the quay.io mirror instead.
+  image: quay.io/minio/minio:RELEASE.2025-07-23T15-54-02Z
+  mcImage: quay.io/minio/mc:RELEASE.2025-07-21T05-28-08Z-cpuv1
+  auth:
+    user: gophprofile
+    password: gophprofile123
+  bucket: avatars
+  persistence:
+    enabled: true
+    size: 1Gi
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits: { cpu: 500m, memory: 512Mi }

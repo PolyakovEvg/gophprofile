@@ -3,6 +3,7 @@ package repositories
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
@@ -21,7 +22,7 @@ const testPostgresImage = "postgres:18.3-alpine3.23"
 func TestAvatarsRepositoryCreateGetUpdateDelete(t *testing.T) {
 	ctx := context.Background()
 	pool := newTestPool(t, ctx)
-	repository := NewAvatarsRepository(pool)
+	repository := NewAvatarsRepository(pool, slog.New(slog.DiscardHandler))
 
 	userID := uuid.MustParse("11111111-1111-1111-1111-111111111111")
 	created, err := repository.Create(ctx, CreateAvatarInput{
@@ -136,7 +137,7 @@ func TestAvatarsRepositoryCreateGetUpdateDelete(t *testing.T) {
 func TestAvatarsRepositoryUpdateMissingAvatar(t *testing.T) {
 	ctx := context.Background()
 	pool := newTestPool(t, ctx)
-	repository := NewAvatarsRepository(pool)
+	repository := NewAvatarsRepository(pool, slog.New(slog.DiscardHandler))
 
 	uploadStatus := models.UploadStatusCompleted
 	_, err := repository.Update(ctx, uuid.New(), UpdateAvatarInput{

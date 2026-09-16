@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/ilyakaznacheev/cleanenv"
 	"github.com/joho/godotenv"
@@ -15,6 +16,12 @@ type AppConfig struct {
 	RabbitMQURL string `env:"RABBITMQ_URL" env-required:"true"`
 	// DatabaseURL is the database connection URL.
 	DatabaseURL string `env:"DATABASE_URL" env-required:"true"`
+
+	// RateLimitRequests is how many requests a single client IP may make to
+	// the /api/v1 routes within RateLimitWindow before getting a 429.
+	RateLimitRequests int `env:"RATE_LIMIT_REQUESTS" env-default:"120"`
+	// RateLimitWindow is the sliding window RateLimitRequests is counted over.
+	RateLimitWindow time.Duration `env:"RATE_LIMIT_WINDOW" env-default:"1m"`
 
 	// S3Region is the AWS S3 region used for object storage.
 	S3Region string `env:"S3_REGION" env-required:"true"`

@@ -5,10 +5,13 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/url"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/pelfox/gophprofile/internal/breaker"
+	"github.com/sony/gobreaker"
 	"go.opentelemetry.io/contrib/instrumentation/github.com/aws/aws-sdk-go-v2/otelaws"
 )
 
@@ -18,6 +21,7 @@ type s3Storage struct {
 	client *s3.Client
 	bucket string
 	prefix string
+	cb     *gobreaker.CircuitBreaker
 }
 
 // S3StorageConfig stores settings needed to create an S3 storage provider.
@@ -29,23 +33,27 @@ type S3StorageConfig struct {
 	Bucket    string
 }
 
-// NewS3Storage creates an S3-backed avatar storage provider.
+// NewS3Storage creates an S3-backed avatar storage provider. Calls to the
+// underlying S3 client go through a circuit breaker, so a sustained S3
+// outage fails fast instead of piling up requests against it.
 func NewS3Storage(
 	client *s3.Client,
 	bucket string,
 	prefix string,
+	logger *slog.Logger,
 ) Provider {
 	return &s3Storage{
 		client: client,
 		bucket: bucket,
 		prefix: prefix,
+		cb:     breaker.New(logger, "s3"),
 	}
 }
 
 // NewS3StorageFromConfig creates an S3-backed provider from storage settings.
-func NewS3StorageFromConfig(cfg S3StorageConfig) Provider {
+func NewS3StorageFromConfig(cfg S3StorageConfig, logger *slog.Logger) Provider {
 	client := NewS3Client(cfg)
-	return NewS3Storage(client, cfg.Bucket, cfg.Endpoint)
+	return NewS3Storage(client, cfg.Bucket, cfg.Endpoint, logger)
 }
 
 // NewS3Client creates an S3 client from storage settings. Exposed
@@ -85,45 +93,59 @@ func (s *s3Storage) Store(
 	ctx context.Context,
 	input StoreInput,
 ) (string, error) {
-	_, err := s.client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket:       aws.String(s.bucket),
-		Key:          aws.String(input.Key),
-		Body:         bytes.NewReader(input.Body),
-		CacheControl: aws.String(cacheControl),
-		ContentType:  aws.String(input.ContentType),
-		Metadata: map[string]string{
-			"user_id":   input.UserID.String(),
-			"avatar_id": input.AvatarID.String(),
-		},
+	result, err := s.cb.Execute(func() (any, error) {
+		_, err := s.client.PutObject(ctx, &s3.PutObjectInput{
+			Bucket:       aws.String(s.bucket),
+			Key:          aws.String(input.Key),
+			Body:         bytes.NewReader(input.Body),
+			CacheControl: aws.String(cacheControl),
+			ContentType:  aws.String(input.ContentType),
+			Metadata: map[string]string{
+				"user_id":   input.UserID.String(),
+				"avatar_id": input.AvatarID.String(),
+			},
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to upload avatar to S3: %w", err)
+		}
+
+		targetURL, err := url.JoinPath(s.prefix, input.Key)
+		if err != nil {
+			return nil, fmt.Errorf("failed to construct target URL: %w", err)
+		}
+
+		return targetURL, nil
 	})
 	if err != nil {
-		return "", fmt.Errorf("failed to upload avatar to S3: %w", err)
+		return "", err
 	}
 
-	targetURL, err := url.JoinPath(s.prefix, input.Key)
-	if err != nil {
-		return "", fmt.Errorf("failed to construct target URL: %w", err)
-	}
-
-	return targetURL, nil
+	return result.(string), nil
 }
 
 func (s *s3Storage) Retrieve(ctx context.Context, key string) ([]byte, error) {
-	result, err := s.client.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: aws.String(s.bucket),
-		Key:    aws.String(key),
+	result, err := s.cb.Execute(func() (any, error) {
+		result, err := s.client.GetObject(ctx, &s3.GetObjectInput{
+			Bucket: aws.String(s.bucket),
+			Key:    aws.String(key),
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to retrieve avatar from S3: %w", err)
+		}
+		defer result.Body.Close()
+
+		payload, err := io.ReadAll(result.Body)
+		if err != nil {
+			return nil, fmt.Errorf("failed to copy avatar body: %w", err)
+		}
+
+		return payload, nil
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to retrieve avatar from S3: %w", err)
-	}
-	defer result.Body.Close()
-
-	payload, err := io.ReadAll(result.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to copy avatar body: %w", err)
+		return nil, err
 	}
 
-	return payload, nil
+	return result.([]byte), nil
 }
 
 func (s *s3Storage) Delete(ctx context.Context, keys []string) error {
@@ -132,9 +154,12 @@ func (s *s3Storage) Delete(ctx context.Context, keys []string) error {
 			continue
 		}
 
-		_, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{
-			Bucket: aws.String(s.bucket),
-			Key:    aws.String(key),
+		_, err := s.cb.Execute(func() (any, error) {
+			_, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{
+				Bucket: aws.String(s.bucket),
+				Key:    aws.String(key),
+			})
+			return nil, err
 		})
 		if err != nil {
 			return fmt.Errorf("failed to delete avatar from S3: %w", err)

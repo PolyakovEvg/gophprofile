@@ -1,0 +1,356 @@
+openapi: 3.0.3
+info:
+  title: GophProfile API
+  description: >
+    Avatar upload, retrieval, and management service. Uploaded images are
+    stored in S3-compatible object storage and asynchronously resized into
+    thumbnails by a background worker.
+  version: "1.0.0"
+servers:
+  - url: /
+tags:
+  - name: avatars
+    description: Avatar upload and management
+  - name: health
+    description: Service health and diagnostics
+
+paths:
+  /health:
+    get:
+      tags: [health]
+      summary: Report service and dependency health
+      description: >
+        Used as the Kubernetes readiness probe. Checks the database, object
+        storage, and message broker connections.
+      operationId: getHealth
+      responses:
+        "200":
+          description: All components are healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+        "503":
+          description: One or more components are unhealthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+
+  /livez:
+    get:
+      tags: [health]
+      summary: Report process liveness
+      description: >
+        Used as the Kubernetes liveness probe. Always returns 200 while the
+        process is running; does not check dependencies.
+      operationId: getLivez
+      responses:
+        "200":
+          description: The process is running
+
+  /metrics:
+    get:
+      tags: [health]
+      summary: Prometheus metrics
+      operationId: getMetrics
+      responses:
+        "200":
+          description: Metrics in the Prometheus text exposition format
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /api/v1/avatars:
+    post:
+      tags: [avatars]
+      summary: Upload a new avatar
+      description: >
+        Accepts an image file, stores the original, and enqueues thumbnail
+        generation. The caller must be authenticated via the X-User-ID header.
+      operationId: uploadAvatar
+      parameters:
+        - $ref: "#/components/parameters/XUserID"
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [avatar_file]
+              properties:
+                avatar_file:
+                  type: string
+                  format: binary
+                  description: JPEG, PNG, or WebP image, up to 10 MiB
+      responses:
+        "201":
+          description: Avatar accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AvatarCreatedResponse"
+        "400":
+          description: Invalid user ID or unsupported file format
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "413":
+          description: File too large
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FileTooLargeResponse"
+        "422":
+          description: Invalid request body or unprocessable file
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          description: Failed to process the file
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/v1/avatars/{avatarID}:
+    get:
+      tags: [avatars]
+      summary: Download the original avatar file
+      operationId: getAvatarByID
+      parameters:
+        - $ref: "#/components/parameters/AvatarID"
+      responses:
+        "200":
+          description: The avatar image
+          content:
+            image/*:
+              schema:
+                type: string
+                format: binary
+        "400":
+          description: Invalid avatar ID
+        "404":
+          description: Avatar not found
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          description: Failed to retrieve avatar
+    delete:
+      tags: [avatars]
+      summary: Delete an avatar
+      operationId: deleteAvatarByID
+      parameters:
+        - $ref: "#/components/parameters/XUserID"
+        - $ref: "#/components/parameters/AvatarID"
+      responses:
+        "204":
+          description: Avatar deleted
+        "400":
+          description: Invalid user or avatar ID
+        "403":
+          description: The caller does not own this avatar
+        "404":
+          description: Avatar not found
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          description: Failed to delete avatar
+
+  /api/v1/avatars/{avatarID}/metadata:
+    get:
+      tags: [avatars]
+      summary: Get avatar metadata
+      operationId: getAvatarMetadata
+      parameters:
+        - $ref: "#/components/parameters/AvatarID"
+      responses:
+        "200":
+          description: Avatar metadata
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AvatarMetadataResponse"
+        "400":
+          description: Invalid avatar ID
+        "404":
+          description: Avatar not found
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          description: Failed to retrieve avatar
+
+  /api/v1/users/{userID}/avatar:
+    get:
+      tags: [avatars]
+      summary: Download a user's latest avatar
+      operationId: getUserAvatar
+      parameters:
+        - $ref: "#/components/parameters/UserID"
+      responses:
+        "200":
+          description: The avatar image
+          content:
+            image/*:
+              schema:
+                type: string
+                format: binary
+        "400":
+          description: Invalid user ID
+        "404":
+          description: Avatar not found
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          description: Failed to retrieve avatar
+    delete:
+      tags: [avatars]
+      summary: Delete a user's latest avatar
+      operationId: deleteUserAvatar
+      parameters:
+        - $ref: "#/components/parameters/UserID"
+        - $ref: "#/components/parameters/XUserID"
+      responses:
+        "204":
+          description: Avatar deleted
+        "400":
+          description: Invalid user ID
+        "403":
+          description: The caller does not own this avatar
+        "404":
+          description: Avatar not found
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          description: Failed to delete avatar
+
+  /api/v1/users/{userID}/avatars:
+    get:
+      tags: [avatars]
+      summary: List a user's avatars
+      operationId: listUserAvatars
+      parameters:
+        - $ref: "#/components/parameters/UserID"
+      responses:
+        "200":
+          description: The user's avatars
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/AvatarMetadataResponse"
+        "400":
+          description: Invalid user ID
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          description: Failed to list avatars
+
+components:
+  responses:
+    TooManyRequests:
+      description: >
+        Rate limit exceeded for this client IP. The response carries
+        X-RateLimit-Limit/Remaining/Reset and Retry-After headers.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+
+  parameters:
+    XUserID:
+      name: X-User-ID
+      in: header
+      required: true
+      description: UUID of the authenticated user
+      schema:
+        type: string
+        format: uuid
+    AvatarID:
+      name: avatarID
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    UserID:
+      name: userID
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+  schemas:
+    UploadStatus:
+      type: string
+      enum: [PENDING, UPLOADING, COMPLETED, FAILED]
+    ProcessingStatus:
+      type: string
+      enum: [PENDING, PROCESSING, COMPLETED, FAILED]
+
+    AvatarCreatedResponse:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        original_url: { type: string }
+        user_id: { type: string, format: uuid }
+        file_name: { type: string }
+        mime_type: { type: string }
+        size_bytes: { type: integer, format: int64 }
+        s3_key: { type: string }
+        upload_status: { $ref: "#/components/schemas/UploadStatus" }
+        processing_status: { $ref: "#/components/schemas/ProcessingStatus" }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    AvatarMetadataResponse:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        user_id: { type: string, format: uuid }
+        file_name: { type: string }
+        mime_type: { type: string }
+        size_bytes: { type: integer, format: int64 }
+        s3_key: { type: string }
+        thumbnail_s3_keys:
+          type: object
+          additionalProperties:
+            type: string
+        upload_status: { $ref: "#/components/schemas/UploadStatus" }
+        processing_status: { $ref: "#/components/schemas/ProcessingStatus" }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    ErrorResponse:
+      type: object
+      properties:
+        error: { type: string }
+        details: { type: string }
+
+    FileTooLargeResponse:
+      type: object
+      properties:
+        error: { type: string }
+        max_size: { type: integer, format: int64 }
+
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded]
+        components:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              status:
+                type: string
+                enum: [ok, error]
