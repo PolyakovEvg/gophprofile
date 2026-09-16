@@ -4,12 +4,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"github.com/Masterminds/squirrel"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/pelfox/gophprofile/internal/breaker"
 	"github.com/pelfox/gophprofile/internal/models"
+	"github.com/sony/gobreaker"
 )
 
 var (
@@ -74,13 +78,24 @@ type AvatarsRepository interface {
 type avatarsRepository struct {
 	pool *pgxpool.Pool
 	sq   squirrel.StatementBuilderType
+	cb   *gobreaker.CircuitBreaker
 }
 
-// NewAvatarsRepository creates an avatar repository backed by a Postgres pool.
-func NewAvatarsRepository(pool *pgxpool.Pool) AvatarsRepository {
+// NewAvatarsRepository creates an avatar repository backed by a Postgres
+// pool. Queries go through a circuit breaker, so a sustained database
+// outage fails fast instead of piling up requests against it; a "no rows"
+// result counts as a success for breaker purposes, since it is a normal
+// query outcome and not a sign the database itself is unhealthy.
+func NewAvatarsRepository(
+	pool *pgxpool.Pool,
+	logger *slog.Logger,
+) AvatarsRepository {
 	return &avatarsRepository{
 		pool: pool,
 		sq:   squirrel.StatementBuilder.PlaceholderFormat(squirrel.Dollar),
+		cb: breaker.NewWithIsSuccessful(logger, "postgres", func(err error) bool {
+			return err == nil || errors.Is(err, pgx.ErrNoRows)
+		}),
 	}
 }
 
@@ -112,14 +127,16 @@ func (r *avatarsRepository) Create(
 		SizeBytes: input.SizeBytes,
 		S3Key:     input.S3Key,
 	}
-	err = r.pool.QueryRow(ctx, query, args...).
-		Scan(
-			&avatar.ID,
-			&avatar.UploadStatus,
-			&avatar.ProcessingStatus,
-			&avatar.CreatedAt,
-			&avatar.UpdatedAt,
-		)
+	_, err = r.cb.Execute(func() (any, error) {
+		return nil, r.pool.QueryRow(ctx, query, args...).
+			Scan(
+				&avatar.ID,
+				&avatar.UploadStatus,
+				&avatar.ProcessingStatus,
+				&avatar.CreatedAt,
+				&avatar.UpdatedAt,
+			)
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to execute query: %w", err)
 	}
@@ -151,38 +168,45 @@ func (r *avatarsRepository) GetForUser(
 		return nil, fmt.Errorf("failed to build query: %w", err)
 	}
 
-	rows, err := r.pool.Query(ctx, query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("failed to execute query: %w", err)
-	}
-	defer rows.Close()
-
-	avatars := make([]models.Avatar, 0)
-	for rows.Next() {
-		avatar := models.Avatar{UserID: userID}
-		err := rows.Scan(
-			&avatar.ID,
-			&avatar.FileName,
-			&avatar.MimeType,
-			&avatar.SizeBytes,
-			&avatar.S3Key,
-			&avatar.ThumbnailS3Keys,
-			&avatar.UploadStatus,
-			&avatar.ProcessingStatus,
-			&avatar.CreatedAt,
-			&avatar.UpdatedAt,
-		)
+	result, err := r.cb.Execute(func() (any, error) {
+		rows, err := r.pool.Query(ctx, query, args...)
 		if err != nil {
-			return nil, fmt.Errorf("failed to scan the row: %w", err)
+			return nil, fmt.Errorf("failed to execute query: %w", err)
 		}
-		avatars = append(avatars, avatar)
+		defer rows.Close()
+
+		avatars := make([]models.Avatar, 0)
+		for rows.Next() {
+			avatar := models.Avatar{UserID: userID}
+			err := rows.Scan(
+				&avatar.ID,
+				&avatar.FileName,
+				&avatar.MimeType,
+				&avatar.SizeBytes,
+				&avatar.S3Key,
+				&avatar.ThumbnailS3Keys,
+				&avatar.UploadStatus,
+				&avatar.ProcessingStatus,
+				&avatar.CreatedAt,
+				&avatar.UpdatedAt,
+			)
+			if err != nil {
+				return nil, fmt.Errorf("failed to scan the row: %w", err)
+			}
+			avatars = append(avatars, avatar)
+		}
+
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("failed to scan: %w", err)
+		}
+
+		return avatars, nil
+	})
+	if err != nil {
+		return nil, err
 	}
 
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("failed to scan: %w", err)
-	}
-
-	return avatars, nil
+	return result.([]models.Avatar), nil
 }
 
 func (r *avatarsRepository) GetByID(
@@ -209,18 +233,20 @@ func (r *avatarsRepository) GetByID(
 	}
 
 	avatar := models.Avatar{ID: id}
-	err = r.pool.QueryRow(ctx, query, args...).Scan(
-		&avatar.UserID,
-		&avatar.FileName,
-		&avatar.MimeType,
-		&avatar.SizeBytes,
-		&avatar.S3Key,
-		&avatar.ThumbnailS3Keys,
-		&avatar.UploadStatus,
-		&avatar.ProcessingStatus,
-		&avatar.CreatedAt,
-		&avatar.UpdatedAt,
-	)
+	_, err = r.cb.Execute(func() (any, error) {
+		return nil, r.pool.QueryRow(ctx, query, args...).Scan(
+			&avatar.UserID,
+			&avatar.FileName,
+			&avatar.MimeType,
+			&avatar.SizeBytes,
+			&avatar.S3Key,
+			&avatar.ThumbnailS3Keys,
+			&avatar.UploadStatus,
+			&avatar.ProcessingStatus,
+			&avatar.CreatedAt,
+			&avatar.UpdatedAt,
+		)
+	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrAvatarNotFound
@@ -261,18 +287,20 @@ func (r *avatarsRepository) Update(
 	}
 
 	avatar := models.Avatar{ID: id}
-	err = r.pool.QueryRow(ctx, query, args...).Scan(
-		&avatar.UserID,
-		&avatar.FileName,
-		&avatar.MimeType,
-		&avatar.SizeBytes,
-		&avatar.S3Key,
-		&avatar.ThumbnailS3Keys,
-		&avatar.UploadStatus,
-		&avatar.ProcessingStatus,
-		&avatar.CreatedAt,
-		&avatar.UpdatedAt,
-	)
+	_, err = r.cb.Execute(func() (any, error) {
+		return nil, r.pool.QueryRow(ctx, query, args...).Scan(
+			&avatar.UserID,
+			&avatar.FileName,
+			&avatar.MimeType,
+			&avatar.SizeBytes,
+			&avatar.S3Key,
+			&avatar.ThumbnailS3Keys,
+			&avatar.UploadStatus,
+			&avatar.ProcessingStatus,
+			&avatar.CreatedAt,
+			&avatar.UpdatedAt,
+		)
+	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrAvatarNotFound
@@ -295,12 +323,14 @@ func (r *avatarsRepository) Delete(
 		return fmt.Errorf("failed to build query: %w", err)
 	}
 
-	result, err := r.pool.Exec(ctx, query, args...)
+	result, err := r.cb.Execute(func() (any, error) {
+		return r.pool.Exec(ctx, query, args...)
+	})
 	if err != nil {
 		return fmt.Errorf("failed to execute query: %w", err)
 	}
 
-	if result.RowsAffected() == 0 {
+	if result.(pgconn.CommandTag).RowsAffected() == 0 {
 		return ErrAvatarNotFound
 	}
 

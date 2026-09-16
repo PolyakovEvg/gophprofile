@@ -1,0 +1,15 @@
+apiVersion: v2
+name: gophprofile
+description: >
+  Avatar upload and thumbnailing service (HTTP API + async worker), packaged
+  for Kubernetes with autoscaling, health probes, Prometheus scraping, and
+  network/pod security policies.
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+keywords:
+  - gophprofile
+  - avatars
+  - image-processing
+maintainers:
+  - name: gophprofile

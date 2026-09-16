@@ -4,11 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"sync"
 
+	"github.com/pelfox/gophprofile/internal/breaker"
 	"github.com/pelfox/gophprofile/internal/tracing"
 	"github.com/pelfox/gophprofile/pkg"
 	amqp "github.com/rabbitmq/amqp091-go"
+	"github.com/sony/gobreaker"
 	"go.opentelemetry.io/otel"
 	semconv "go.opentelemetry.io/otel/semconv/v1.34.0"
 	"go.opentelemetry.io/otel/trace"
@@ -18,10 +21,13 @@ type rabbitMQQueue struct {
 	channel *amqp.Channel
 	queues  map[string]amqp.Queue
 	mu      sync.Mutex
+	cb      *gobreaker.CircuitBreaker
 }
 
-// NewRabbitMQQueue creates a RabbitMQ-backed queue provider.
-func NewRabbitMQQueue(conn *amqp.Connection) (PublisherProvider, error) {
+// NewRabbitMQQueue creates a RabbitMQ-backed queue provider. Publishes go
+// through a circuit breaker, so a sustained broker outage fails fast
+// instead of piling up blocked publishers.
+func NewRabbitMQQueue(conn *amqp.Connection, logger *slog.Logger) (PublisherProvider, error) {
 	channel, err := conn.Channel()
 	if err != nil {
 		return nil, fmt.Errorf("failed to open a new RabbitMQ channel: %w", err)
@@ -53,6 +59,7 @@ func NewRabbitMQQueue(conn *amqp.Connection) (PublisherProvider, error) {
 	return &rabbitMQQueue{
 		channel: channel,
 		queues:  queues,
+		cb:      breaker.New(logger, "rabbitmq"),
 	}, nil
 }
 
@@ -110,17 +117,20 @@ func (r *rabbitMQQueue) publish(
 		Body:         body,
 	}
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	_, err = r.cb.Execute(func() (any, error) {
+		r.mu.Lock()
+		defer r.mu.Unlock()
 
-	if err := r.channel.PublishWithContext(
-		ctx,
-		"",
-		queue.Name,
-		false,
-		false,
-		publishing,
-	); err != nil {
+		return nil, r.channel.PublishWithContext(
+			ctx,
+			"",
+			queue.Name,
+			false,
+			false,
+			publishing,
+		)
+	})
+	if err != nil {
 		return fmt.Errorf("failed to publish request message: %w", err)
 	}
 

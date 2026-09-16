@@ -32,6 +32,17 @@ var (
 		},
 		[]string{"queue"},
 	)
+
+	// CircuitBreakerState reports the current state of each dependency's
+	// circuit breaker: 0 = closed, 1 = half-open, 2 = open (matching
+	// gobreaker.State's own ordering).
+	CircuitBreakerState = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "circuit_breaker_state",
+			Help: "Circuit breaker state per dependency (0=closed, 1=half-open, 2=open).",
+		},
+		[]string{"dependency"},
+	)
 )
 
 // WatchDBPool periodically reports pool connection stats until ctx is done.

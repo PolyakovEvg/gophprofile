@@ -1,0 +1,42 @@
+{{- if .Values.migrationHook.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "gophprofile.fullname" . }}-migrate-{{ .Release.Revision }}
+  labels:
+    {{- include "gophprofile.componentLabels" (dict "component" "migrate" "Release" .Release "Chart" .Chart) | nindent 4 }}
+  annotations:
+    # Runs after the release's Deployments/Services/infra are created (so a
+    # bundled dev Postgres pod exists to connect to) but before any new
+    # server/worker pods created by a later upgrade start serving traffic
+    # against a schema they don't expect.
+    "helm.sh/hook": post-install,pre-upgrade
+    "helm.sh/hook-weight": "0"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: {{ .Values.migrationHook.backoffLimit }}
+  activeDeadlineSeconds: {{ .Values.migrationHook.activeDeadlineSeconds }}
+  template:
+    metadata:
+      labels:
+        {{- include "gophprofile.selectorLabels" (dict "component" "migrate" "Release" .Release "Chart" .Chart) | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      serviceAccountName: {{ include "gophprofile.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automount }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: migrate
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["./migrate"]
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          envFrom:
+            - secretRef:
+                name: {{ include "gophprofile.secretName" . }}
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: 250m, memory: 128Mi }
+{{- end }}

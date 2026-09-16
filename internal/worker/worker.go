@@ -78,7 +78,7 @@ func Run(
 	}
 	defer conn.Close()
 
-	queueProvider, err := queue.NewRabbitMQQueue(conn)
+	queueProvider, err := queue.NewRabbitMQQueue(conn, logger)
 	if err != nil {
 		return err
 	}
@@ -95,7 +95,7 @@ func Run(
 	processor := &processor{
 		logger:  logger.With("worker", "avatar"),
 		queue:   queueProvider,
-		storage: storage.NewS3Storage(s3Client, cfg.S3Bucket, cfg.S3Endpoint),
+		storage: storage.NewS3Storage(s3Client, cfg.S3Bucket, cfg.S3Endpoint, logger),
 	}
 
 	if err := metrics.WatchQueueDepths(ctx, logger, conn, []string{
@@ -151,6 +151,12 @@ func Run(
 
 func metricsRouter(healthController *controllers.HealthController) http.Handler {
 	mux := http.NewServeMux()
+	// livez only reports that the process is up; unlike /health it does not
+	// probe dependencies, so it is safe to use as a Kubernetes liveness probe
+	// without risking restart loops during a transient broker/S3 outage.
+	mux.HandleFunc("/livez", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
 	mux.HandleFunc("/health", healthController.Health)
 	mux.Handle("/metrics", promhttp.Handler())
 	return mux

@@ -1,0 +1,73 @@
+# Production overlay: `helm install gophprofile ./deploy/helm/gophprofile -f values-prod.yaml`
+#
+# Disables the bundled dev Postgres/RabbitMQ/MinIO and points the app at
+# managed/external services instead, raises replica counts and resource
+# limits, and enables TLS on the ingress. Fill in the placeholders below
+# (image repository/tag, host, secret) before installing.
+
+image:
+  repository: registry.example.com/gophprofile
+  tag: "1.0.0"
+  pullPolicy: IfNotPresent
+
+config:
+  s3Region: us-east-1
+  s3Endpoint: "" # empty for real AWS S3, or set for an S3-compatible provider
+  s3Bucket: gophprofile-avatars-prod
+  otelExporterEndpoint: "otel-collector.observability.svc.cluster.local:4317"
+
+# In production, prefer an out-of-band Secret (Vault/External Secrets/sealed-
+# secrets) over chart-rendered credentials:
+secret:
+  existingSecret: "gophprofile-credentials"
+
+server:
+  replicaCount: 3
+  resources:
+    requests: { cpu: 250m, memory: 256Mi }
+    limits: { cpu: 1000m, memory: 512Mi }
+  autoscaling:
+    enabled: true
+    minReplicas: 3
+    maxReplicas: 20
+
+worker:
+  replicaCount: 3
+  resources:
+    requests: { cpu: 250m, memory: 256Mi }
+    limits: { cpu: 1500m, memory: 1Gi }
+  autoscaling:
+    enabled: true
+    minReplicas: 3
+    maxReplicas: 15
+
+ingress:
+  enabled: true
+  className: nginx
+  host: gophprofile.example.com
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+  tls:
+    enabled: true
+    secretName: gophprofile-tls
+
+networkPolicy:
+  enabled: true
+  ingressNamespaceLabel:
+    kubernetes.io/metadata.name: ingress-nginx
+  monitoringNamespaceLabel:
+    kubernetes.io/metadata.name: monitoring
+
+serviceMonitor:
+  enabled: true
+  additionalLabels:
+    release: kube-prometheus-stack
+
+postgresql:
+  enabled: false
+rabbitmq:
+  enabled: false
+minio:
+  enabled: false
+migrationHook:
+  enabled: true
